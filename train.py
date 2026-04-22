@@ -42,6 +42,7 @@ from typing import Dict, List, Optional
 
 import torch
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 log = logging.getLogger(__name__)
 
@@ -261,25 +262,26 @@ def run_individual(
                                 ).theta.detach().clone()
                  for i in range(len(clients))}
 
-    round_pbar = tqdm(range(1, num_rounds + 1), desc="individual", unit="round")
-    for t in round_pbar:
-        t0      = time.time()
-        uploads = {i: clients[i].local_train(thetas[i]) for i in range(len(clients))}
-        thetas  = uploads
+    with logging_redirect_tqdm():
+        round_pbar = tqdm(range(1, num_rounds + 1), desc="individual", unit="round")
+        for t in round_pbar:
+            t0      = time.time()
+            uploads = {i: clients[i].local_train(thetas[i]) for i in range(len(clients))}
+            thetas  = uploads
 
-        val_losses = None
-        if t % 5 == 0:
-            val_losses = {i: clients[i].compute_val_loss(thetas[i]) for i in range(len(clients))}
-            valid = [v for v in val_losses.values() if not math.isnan(v)]
-            if valid:
-                round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
-            for i, client in enumerate(clients):
-                q = client.generate_question(thetas[i])
-                log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
+            val_losses = None
+            if t % 5 == 0:
+                val_losses = {i: clients[i].compute_val_loss(thetas[i]) for i in range(len(clients))}
+                valid = [v for v in val_losses.values() if not math.isnan(v)]
+                if valid:
+                    round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
+                for i, client in enumerate(clients):
+                    q = client.generate_question(thetas[i])
+                    log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
 
-        _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
-        if t % 10 == 0:
-            _save_checkpoint(output_dir, t, {"thetas": thetas, "round": t})
+            _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
+            if t % 10 == 0:
+                _save_checkpoint(output_dir, t, {"thetas": thetas, "round": t})
 
     _save_checkpoint(output_dir, num_rounds, {"thetas": thetas, "round": num_rounds})
     return thetas
@@ -305,30 +307,31 @@ def _run_federated(
         server._client_thetas = state["thetas"]
 
     method_name = type(server).__name__
-    round_pbar  = tqdm(range(start_round, num_rounds + 1), desc=method_name, unit="round")
-    for t in round_pbar:
-        t0        = time.time()
-        thetas_in = server.broadcast()
-        uploads   = {i: clients[i].local_train(thetas_in[i]) for i in range(len(clients))}
-        server.aggregate(t, uploads)
+    with logging_redirect_tqdm():
+        round_pbar  = tqdm(range(start_round, num_rounds + 1), desc=method_name, unit="round")
+        for t in round_pbar:
+            t0        = time.time()
+            thetas_in = server.broadcast()
+            uploads   = {i: clients[i].local_train(thetas_in[i]) for i in range(len(clients))}
+            server.aggregate(t, uploads)
 
-        val_losses = None
-        if t % 5 == 0:
-            val_losses = {i: clients[i].compute_val_loss(uploads[i]) for i in range(len(clients))}
-            valid = [v for v in val_losses.values() if not math.isnan(v)]
-            if valid:
-                k = server.cluster_result.num_clusters if server.cluster_result else "?"
-                round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
-            for i, client in enumerate(clients):
-                q = client.generate_question(uploads[i])
-                log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
+            val_losses = None
+            if t % 5 == 0:
+                val_losses = {i: clients[i].compute_val_loss(uploads[i]) for i in range(len(clients))}
+                valid = [v for v in val_losses.values() if not math.isnan(v)]
+                if valid:
+                    k = server.cluster_result.num_clusters if server.cluster_result else "?"
+                    round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
+                for i, client in enumerate(clients):
+                    q = client.generate_question(uploads[i])
+                    log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
 
-        _log_round(t, num_rounds, uploads, server.cluster_result,
-                   time.time() - t0, log_path, val_losses)
+            _log_round(t, num_rounds, uploads, server.cluster_result,
+                       time.time() - t0, log_path, val_losses)
 
-        if t % 10 == 0:
-            _save_checkpoint(output_dir, t,
-                             {"thetas": server._client_thetas, "round": t})
+            if t % 10 == 0:
+                _save_checkpoint(output_dir, t,
+                                 {"thetas": server._client_thetas, "round": t})
 
     # Final checkpoint
     _save_checkpoint(output_dir, num_rounds,

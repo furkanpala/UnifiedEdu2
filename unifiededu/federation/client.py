@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.func import functional_call
 from torch.optim import AdamW
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 log = logging.getLogger(__name__)
 
@@ -216,36 +217,37 @@ class FederationClient:
         theta.train()
         optimizer.zero_grad()
 
-        for epoch in range(local_eps):
-            pending    = 0
-            epoch_loss = 0.0
-            n_batches  = 0
-            ep_label   = f"C{self.client_id}({self.model_name}) ep{epoch+1}/{local_eps}"
-            pbar = tqdm(self.dataloader, desc=ep_label, leave=False, unit="batch")
-            for batch in pbar:
-                loss = self._compute_loss(batch, theta)
-                (loss / accum).backward()
-                pending    += 1
-                epoch_loss += loss.item()
-                n_batches  += 1
+        with logging_redirect_tqdm():
+            for epoch in range(local_eps):
+                pending    = 0
+                epoch_loss = 0.0
+                n_batches  = 0
+                ep_label   = f"C{self.client_id}({self.model_name}) ep{epoch+1}/{local_eps}"
+                pbar = tqdm(self.dataloader, desc=ep_label, leave=False, unit="batch")
+                for batch in pbar:
+                    loss = self._compute_loss(batch, theta)
+                    (loss / accum).backward()
+                    pending    += 1
+                    epoch_loss += loss.item()
+                    n_batches  += 1
 
-                if pending == accum:
+                    if pending == accum:
+                        torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        pending = 0
+
+                # Flush remaining gradients at end of epoch
+                if pending > 0:
                     torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
-                    pending = 0
 
-            # Flush remaining gradients at end of epoch
-            if pending > 0:
-                torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-            avg = epoch_loss / max(n_batches, 1)
-            log.info(
-                "C%d(%s) ep%d/%d  avg_loss=%.4f",
-                self.client_id, self.model_name, epoch + 1, local_eps, avg,
-            )
+                avg = epoch_loss / max(n_batches, 1)
+                log.info(
+                    "C%d(%s) ep%d/%d  avg_loss=%.4f",
+                    self.client_id, self.model_name, epoch + 1, local_eps, avg,
+                )
 
         return theta.theta.detach().clone()
 
