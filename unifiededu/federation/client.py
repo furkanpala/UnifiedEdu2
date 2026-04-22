@@ -264,28 +264,22 @@ class FederationClient:
                 n += 1
         return total / max(n, 1)
 
-    def generate_question(
+    def generate_qa(
         self,
         theta_flat:     torch.Tensor,
-        max_new_tokens: int = 50,
+        max_new_tokens: int = 40,
     ) -> str:
         """
-        Generate one question from the stored context sample using modulated weights.
+        Generate one QA pair from the stored context sample using modulated weights.
 
-        Temporarily swaps modulated weights into the frozen backbone for generation,
-        then restores the originals.
+        Swaps modulated weights into the frozen backbone once, runs two greedy
+        passes (Q then A), and restores the originals.
         """
         if self.tokenizer is None or not self.sample_context:
             return "[no sample context]"
         try:
             theta     = theta_from_flat(theta_flat.to(self.device), self.k_edge, self.k_node)
             modulated = modulate_params(self.model, theta, self.layer_groups)
-
-            prompt    = f"Context: {self.sample_context}\nQuestion:"
-            enc       = self.tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=256,
-            )
-            input_ids = enc["input_ids"].to(self.device)
 
             named_params = dict(self.model.named_parameters())
             originals: Dict[str, torch.Tensor] = {}
@@ -295,23 +289,38 @@ class FederationClient:
                     named_params[pname].data.copy_(val)
 
             try:
-                with torch.no_grad():
-                    out_ids = self.model.generate(
-                        input_ids,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        pad_token_id=getattr(self.tokenizer, "pad_token_id", 0) or 0,
-                    )
+                q_prompt = f"Context: {self.sample_context}\nQuestion:"
+                question = self._run_generate(q_prompt, max_new_tokens)
+
+                a_prompt = f"Context: {self.sample_context}\nQuestion: {question}\nAnswer:"
+                answer   = self._run_generate(a_prompt, max_new_tokens)
             finally:
                 for pname, orig in originals.items():
                     named_params[pname].data.copy_(orig)
 
-            new_ids = out_ids[0][input_ids.shape[1]:]
-            return self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            return f"Q: {question} | A: {answer}"
 
         except Exception as exc:
-            log.debug("generate_question error: %s", exc)
+            log.debug("generate_qa error: %s", exc)
             return "[generation error]"
+
+    def _run_generate(self, prompt: str, max_new_tokens: int) -> str:
+        """Tokenise prompt, run model.generate with sampling, decode new tokens."""
+        enc       = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
+        input_ids = enc["input_ids"].to(self.device)
+        pad_id    = getattr(self.tokenizer, "pad_token_id", 0) or 0
+        with torch.no_grad():
+            out_ids = self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+                repetition_penalty=1.3,
+                no_repeat_ngram_size=3,
+                pad_token_id=pad_id,
+            )
+        new_ids = out_ids[0][input_ids.shape[1]:]
+        return self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
     # ------------------------------------------------------------------
     # Internal helpers

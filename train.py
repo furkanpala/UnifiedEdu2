@@ -276,7 +276,7 @@ def run_individual(
                 if valid:
                     round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
                 for i, client in enumerate(clients):
-                    q = client.generate_question(thetas[i])
+                    q = client.generate_qa(thetas[i])
                     log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
 
             _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
@@ -323,7 +323,7 @@ def _run_federated(
                     k = server.cluster_result.num_clusters if server.cluster_result else "?"
                     round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
                 for i, client in enumerate(clients):
-                    q = client.generate_question(uploads[i])
+                    q = client.generate_qa(uploads[i])
                     log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
 
             _log_round(t, num_rounds, uploads, server.cluster_result,
