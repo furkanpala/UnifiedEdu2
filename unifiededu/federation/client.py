@@ -103,18 +103,20 @@ def modulate_params(
 
         # Weight (edge modulation) -- scalar broadcast over full matrix
         w = module.weight.detach()
-        params[name + ".weight"] = _soft_sign(
-            w * theta.theta_edge[eg] + theta.theta_edge_shift[eg],
+        w_mod = _soft_sign(
+            w.float() * theta.theta_edge[eg] + theta.theta_edge_shift[eg],
             theta.theta_scale_edge,
         )
+        params[name + ".weight"] = w_mod.to(w.dtype)
 
         # Bias (node modulation)
         if module.bias is not None:
             b = module.bias.detach()
-            params[name + ".bias"] = _soft_sign(
-                b * theta.theta_node[ng] + theta.theta_node_shift[ng],
+            b_mod = _soft_sign(
+                b.float() * theta.theta_node[ng] + theta.theta_node_shift[ng],
                 theta.theta_scale_node,
             )
+            params[name + ".bias"] = b_mod.to(b.dtype)
 
     return params
 
