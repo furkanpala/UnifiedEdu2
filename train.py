@@ -44,6 +44,9 @@ import torch
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+import transformers
+transformers.logging.set_verbosity_error()
+
 log = logging.getLogger(__name__)
 
 
@@ -262,7 +265,7 @@ def run_individual(
                                 ).theta.detach().clone()
                  for i in range(len(clients))}
 
-    with logging_redirect_tqdm():
+    with logging_redirect_tqdm(tqdm_class=tqdm):
         round_pbar = tqdm(range(1, num_rounds + 1), desc="individual", unit="round")
         for t in round_pbar:
             t0      = time.time()
@@ -307,7 +310,7 @@ def _run_federated(
         server._client_thetas = state["thetas"]
 
     method_name = type(server).__name__
-    with logging_redirect_tqdm():
+    with logging_redirect_tqdm(tqdm_class=tqdm):
         round_pbar  = tqdm(range(start_round, num_rounds + 1), desc=method_name, unit="round")
         for t in round_pbar:
             t0        = time.time()
