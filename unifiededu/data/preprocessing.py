@@ -140,9 +140,15 @@ def _flatten_to_samples(records: List[dict], client_name: str) -> List[dict]:
         bloom = meta.get("bloom_level", "unknown")
 
         for qa in rec.get("qa_pairs", []):
+<<<<<<< HEAD
             # Deterministic ID from content
             raw_id = f"{client_name}_{rec['input_index']}_{qa['question'][:40]}"
             sid    = hashlib.md5(raw_id.encode()).hexdigest()[:12]
+=======
+            # Deterministic ID from full content (avoid collisions on similar questions)
+            raw_id = f"{client_name}|{rec['input_index']}|{qa['question']}|{qa['answer'][:60]}"
+            sid    = hashlib.md5(raw_id.encode("utf-8")).hexdigest()[:16]
+>>>>>>> 9e0cc5677294928b6f41dd80931d26dd2eac2e06
 
             samples.append({
                 "sample_id":  sid,
@@ -269,8 +275,14 @@ def _split_samples(
     non_anchor = [s for s in samples if s["sample_id"] not in used_ids]
     rng.shuffle(non_anchor)
     still_needed = max(0, n_test - len(test_set))
+<<<<<<< HEAD
     test_set.extend(non_anchor[:still_needed])
     used_ids.update(s["sample_id"] for s in test_set[:still_needed])
+=======
+    extra = non_anchor[:still_needed]
+    test_set.extend(extra)
+    used_ids.update(s["sample_id"] for s in extra)
+>>>>>>> 9e0cc5677294928b6f41dd80931d26dd2eac2e06
 
     # Everything not in test is available for train / val
     remaining = [s for s in samples if s["sample_id"] not in used_ids]
