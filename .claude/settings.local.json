@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//usr/**)",
+      "Read(//usr/local/**)",
+      "Bash(command -v conda)",
+      "Read(//c/Users/fp223/anaconda3/bin/**)",
+      "Read(//c/Users/fp223/miniconda3/bin/**)",
+      "Read(//c/Users/fp223/AppData/Local/Programs/**)",
+      "Bash(ls /c/Python*)",
+      "Read(//c/ProgramData/Anaconda3/**)",
+      "Read(//c/Users/fp223/**)",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe --version)",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_model_graph.py)",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe -c 'import torch; print\\('\\\\''torch'\\\\'', torch.__version__\\)')",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe -c 'import scipy, sklearn; print\\('\\\\''scipy'\\\\'', scipy.__version__, '\\\\''sklearn'\\\\'', sklearn.__version__\\)')",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_clustering.py)",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_federation.py)",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe -c ' *)",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe -c 'import sentence_transformers; print\\('\\\\''sentence_transformers'\\\\'', sentence_transformers.__version__\\)')",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe -c 'import sklearn; from sklearn.manifold import TSNE; print\\('\\\\''TSNE ok'\\\\''\\)')",
+      "Bash(/c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe -c 'from scipy.spatial.distance import cosine; print\\('\\\\''scipy cosine ok'\\\\''\\)')"
+    ]
+  }
+}
