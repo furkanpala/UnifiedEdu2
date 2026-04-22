@@ -147,6 +147,9 @@ def _make_client(
         shuffle=False,
     ) if val_samples else None
 
+    pool = val_samples or train_samples
+    sample_context = pool[0].get("context", "") if pool else None
+
     log.info(
         "Client %d (%s) — %d train / %d val samples, model: %s",
         client_id, ["mit", "stanford", "papers"][client_id],
@@ -164,6 +167,8 @@ def _make_client(
         fed_config=cfg.federation,
         train_config=cfg.training,
         model_name=model_name,
+        tokenizer=tokenizer,
+        sample_context=sample_context,
         device=device,
     )
 
@@ -268,6 +273,9 @@ def run_individual(
             valid = [v for v in val_losses.values() if not math.isnan(v)]
             if valid:
                 round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
+            for i, client in enumerate(clients):
+                q = client.generate_question(thetas[i])
+                log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
 
         _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
         if t % 10 == 0:
@@ -311,6 +319,9 @@ def _run_federated(
             if valid:
                 k = server.cluster_result.num_clusters if server.cluster_result else "?"
                 round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
+            for i, client in enumerate(clients):
+                q = client.generate_question(uploads[i])
+                log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
 
         _log_round(t, num_rounds, uploads, server.cluster_result,
                    time.time() - t0, log_path, val_losses)

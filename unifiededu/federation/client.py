@@ -15,6 +15,7 @@ the frozen HuggingFace backbone without mutating it.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, Iterator, Optional, Tuple
 
 import torch
@@ -22,6 +23,8 @@ import torch.nn as nn
 from torch.func import functional_call
 from torch.optim import AdamW
 from tqdm import tqdm
+
+log = logging.getLogger(__name__)
 
 from ..models.gnn_params import ThetaVector, theta_from_flat, _soft_sign
 from ..config import FederationConfig, TrainingConfig
@@ -156,6 +159,8 @@ class FederationClient:
         train_config:   TrainingConfig,
         val_dataloader  = None,
         model_name:     str = "unknown",
+        tokenizer       = None,
+        sample_context: Optional[str] = None,
         device:         str = "cpu",
     ) -> None:
         self.client_id      = client_id
@@ -167,6 +172,8 @@ class FederationClient:
         self.fed_config     = fed_config
         self.train_config   = train_config
         self.model_name     = model_name
+        self.tokenizer      = tokenizer
+        self.sample_context = sample_context
         self.device         = device
 
         # Freeze ALL backbone parameters
@@ -210,14 +217,17 @@ class FederationClient:
         optimizer.zero_grad()
 
         for epoch in range(local_eps):
-            pending  = 0
-            ep_label = f"C{self.client_id}({self.model_name}) ep{epoch+1}/{local_eps}"
+            pending    = 0
+            epoch_loss = 0.0
+            n_batches  = 0
+            ep_label   = f"C{self.client_id}({self.model_name}) ep{epoch+1}/{local_eps}"
             pbar = tqdm(self.dataloader, desc=ep_label, leave=False, unit="batch")
             for batch in pbar:
                 loss = self._compute_loss(batch, theta)
                 (loss / accum).backward()
-                pending += 1
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                pending    += 1
+                epoch_loss += loss.item()
+                n_batches  += 1
 
                 if pending == accum:
                     torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
@@ -230,6 +240,12 @@ class FederationClient:
                 torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+
+            avg = epoch_loss / max(n_batches, 1)
+            log.info(
+                "C%d(%s) ep%d/%d  avg_loss=%.4f",
+                self.client_id, self.model_name, epoch + 1, local_eps, avg,
+            )
 
         return theta.theta.detach().clone()
 
@@ -245,6 +261,55 @@ class FederationClient:
                 total += self._compute_loss(batch, theta).item()
                 n += 1
         return total / max(n, 1)
+
+    def generate_question(
+        self,
+        theta_flat:     torch.Tensor,
+        max_new_tokens: int = 50,
+    ) -> str:
+        """
+        Generate one question from the stored context sample using modulated weights.
+
+        Temporarily swaps modulated weights into the frozen backbone for generation,
+        then restores the originals.
+        """
+        if self.tokenizer is None or not self.sample_context:
+            return "[no sample context]"
+        try:
+            theta     = theta_from_flat(theta_flat.to(self.device), self.k_edge, self.k_node)
+            modulated = modulate_params(self.model, theta, self.layer_groups)
+
+            prompt    = f"Context: {self.sample_context}\nQuestion:"
+            enc       = self.tokenizer(
+                prompt, return_tensors="pt", truncation=True, max_length=256,
+            )
+            input_ids = enc["input_ids"].to(self.device)
+
+            named_params = dict(self.model.named_parameters())
+            originals: Dict[str, torch.Tensor] = {}
+            for pname, val in modulated.items():
+                if pname in named_params:
+                    originals[pname] = named_params[pname].data.clone()
+                    named_params[pname].data.copy_(val)
+
+            try:
+                with torch.no_grad():
+                    out_ids = self.model.generate(
+                        input_ids,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=getattr(self.tokenizer, "pad_token_id", 0) or 0,
+                    )
+            finally:
+                for pname, orig in originals.items():
+                    named_params[pname].data.copy_(orig)
+
+            new_ids = out_ids[0][input_ids.shape[1]:]
+            return self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+        except Exception as exc:
+            log.debug("generate_question error: %s", exc)
+            return "[generation error]"
 
     # ------------------------------------------------------------------
     # Internal helpers
