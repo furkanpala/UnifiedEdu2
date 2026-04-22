@@ -250,10 +250,6 @@ class FederationClient:
                         optimizer.step()
                         optimizer.zero_grad()
                         pending = 0
-                    
-                    # Optional: Update the bar with the latest loss
-                    if n_batches % 5 == 0:
-                        pbar.set_postfix(loss=f"{current_val:.4f}")
 
                 # Flush remaining gradients at end of epoch
                 if pending > 0:
