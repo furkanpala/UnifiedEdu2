@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 from torch.optim import AdamW
+from tqdm import tqdm
 
 from ..models.gnn_params import ThetaVector, theta_from_flat, _soft_sign
 from ..config import FederationConfig, TrainingConfig
@@ -146,23 +147,27 @@ class FederationClient:
 
     def __init__(
         self,
-        client_id:    int,
-        model:        nn.Module,
+        client_id:      int,
+        model:          nn.Module,
         dataloader,
-        k_edge:       int,
-        k_node:       int,
-        fed_config:   FederationConfig,
-        train_config: TrainingConfig,
-        device:       str = "cpu",
+        k_edge:         int,
+        k_node:         int,
+        fed_config:     FederationConfig,
+        train_config:   TrainingConfig,
+        val_dataloader  = None,
+        model_name:     str = "unknown",
+        device:         str = "cpu",
     ) -> None:
-        self.client_id    = client_id
-        self.model        = model.to(device)
-        self.dataloader   = dataloader
-        self.k_edge       = k_edge
-        self.k_node       = k_node
-        self.fed_config   = fed_config
-        self.train_config = train_config
-        self.device       = device
+        self.client_id      = client_id
+        self.model          = model.to(device)
+        self.dataloader     = dataloader
+        self.val_dataloader = val_dataloader
+        self.k_edge         = k_edge
+        self.k_node         = k_node
+        self.fed_config     = fed_config
+        self.train_config   = train_config
+        self.model_name     = model_name
+        self.device         = device
 
         # Freeze ALL backbone parameters
         for p in self.model.parameters():
@@ -199,29 +204,47 @@ class FederationClient:
             weight_decay=self.train_config.weight_decay,
         )
 
-        accum   = self.train_config.gradient_accumulation_steps
+        accum     = self.train_config.gradient_accumulation_steps
+        local_eps = self.train_config.local_epochs
         theta.train()
         optimizer.zero_grad()
-        pending = 0
 
-        for step, batch in enumerate(self.dataloader):
-            loss = self._compute_loss(batch, theta)
-            (loss / accum).backward()
-            pending += 1
+        for epoch in range(local_eps):
+            pending  = 0
+            ep_label = f"C{self.client_id}({self.model_name}) ep{epoch+1}/{local_eps}"
+            pbar = tqdm(self.dataloader, desc=ep_label, leave=False, unit="batch")
+            for batch in pbar:
+                loss = self._compute_loss(batch, theta)
+                (loss / accum).backward()
+                pending += 1
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-            if pending == accum:
+                if pending == accum:
+                    torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    pending = 0
+
+            # Flush remaining gradients at end of epoch
+            if pending > 0:
                 torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                pending = 0
-
-        # Flush any remaining accumulated gradients
-        if pending > 0:
-            torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
 
         return theta.theta.detach().clone()
+
+    def compute_val_loss(self, theta_flat: torch.Tensor) -> float:
+        """Mean loss on the validation set; returns nan if no val_dataloader."""
+        if self.val_dataloader is None:
+            return float("nan")
+        theta = theta_from_flat(theta_flat.to(self.device), self.k_edge, self.k_node)
+        theta.eval()
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                total += self._compute_loss(batch, theta).item()
+                n += 1
+        return total / max(n, 1)
 
     # ------------------------------------------------------------------
     # Internal helpers

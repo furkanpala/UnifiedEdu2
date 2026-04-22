@@ -33,6 +33,7 @@ class TrainingConfig:
     beta2:                       float = 0.999
     weight_decay:                float = 1e-2
     batch_size:                  int   = 8
+    local_epochs:                int   = 1     # local SGD epochs per round (E in FedAvg)
     gradient_accumulation_steps: int   = 4
     max_seq_len:                 int   = 512
     chunk_stride:                int   = 128

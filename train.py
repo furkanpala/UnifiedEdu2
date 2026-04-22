@@ -34,12 +34,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+from tqdm import tqdm
 
 log = logging.getLogger(__name__)
 
@@ -118,31 +120,50 @@ def _load_mock_model():
 # ---------------------------------------------------------------------------
 
 def _make_client(
-    client_id:   int,
+    client_id:    int,
     model,
     tokenizer,
-    samples:     list,
+    train_samples: list,
+    val_samples:   list,
+    model_name:    str,
     cfg,
-    device:      str,
+    device:        str,
 ):
     from unifiededu.data.dataset import make_dataloader
     from unifiededu.federation.client import FederationClient
 
-    loader = make_dataloader(
-        samples,
+    train_loader = make_dataloader(
+        train_samples,
         tokenizer,
         batch_size=cfg.training.batch_size,
         max_length=cfg.training.max_seq_len,
         shuffle=True,
     )
+    val_loader = make_dataloader(
+        val_samples,
+        tokenizer,
+        batch_size=cfg.training.batch_size,
+        max_length=cfg.training.max_seq_len,
+        shuffle=False,
+    ) if val_samples else None
+
+    log.info(
+        "Client %d (%s) — %d train / %d val samples, model: %s",
+        client_id, ["mit", "stanford", "papers"][client_id],
+        len(train_samples), len(val_samples) if val_samples else 0,
+        model_name,
+    )
+
     return FederationClient(
         client_id=client_id,
         model=model,
-        dataloader=loader,
+        dataloader=train_loader,
+        val_dataloader=val_loader,
         k_edge=cfg.model_graph.k_edge,
         k_node=cfg.model_graph.k_node,
         fed_config=cfg.federation,
         train_config=cfg.training,
+        model_name=model_name,
         device=device,
     )
 
@@ -175,31 +196,41 @@ def _load_latest_checkpoint(output_dir: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _log_round(
-    round_num: int,
+    round_num:  int,
     total_rounds: int,
-    uploads: Dict[int, torch.Tensor],
+    uploads:    Dict[int, torch.Tensor],
     cluster_result,
-    elapsed_s: float,
-    log_path: str,
+    elapsed_s:  float,
+    log_path:   str,
+    val_losses: Optional[Dict[int, float]] = None,
 ) -> None:
     theta_norms = {cid: float(t.norm()) for cid, t in uploads.items()}
-    record = {
-        "round":       round_num,
+    record: dict = {
+        "round":        round_num,
         "num_clusters": cluster_result.num_clusters if cluster_result else None,
         "silhouette":   cluster_result.silhouette   if cluster_result else None,
         "theta_norms":  theta_norms,
         "elapsed_s":    elapsed_s,
     }
+    if val_losses is not None:
+        valid = [v for v in val_losses.values() if not math.isnan(v)]
+        record["val_loss_mean"]    = sum(valid) / len(valid) if valid else None
+        record["val_losses_per_client"] = {str(k): v for k, v in val_losses.items()}
+
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
     if round_num % 5 == 0 or round_num == 1:
         k   = record["num_clusters"] or "?"
         sil = f"{record['silhouette']:.4f}" if record["silhouette"] else "?"
+        val_str = ""
+        if record.get("val_loss_mean") is not None:
+            val_str = f"  val={record['val_loss_mean']:.4f}"
         log.info(
-            "Round %3d/%d  K=%s  sil=%s  |theta|=%.4f  %.1fs",
+            "Round %3d/%d  K=%s  sil=%s  |theta|=%.4f%s  %.1fs",
             round_num, total_rounds, k, sil,
             sum(theta_norms.values()) / len(theta_norms),
+            val_str,
             elapsed_s,
         )
 
@@ -225,12 +256,20 @@ def run_individual(
                                 ).theta.detach().clone()
                  for i in range(len(clients))}
 
-    for t in range(1, num_rounds + 1):
+    round_pbar = tqdm(range(1, num_rounds + 1), desc="individual", unit="round")
+    for t in round_pbar:
         t0      = time.time()
         uploads = {i: clients[i].local_train(thetas[i]) for i in range(len(clients))}
-        thetas  = uploads   # each client keeps its own updated theta
+        thetas  = uploads
 
-        _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path)
+        val_losses = None
+        if t % 5 == 0:
+            val_losses = {i: clients[i].compute_val_loss(thetas[i]) for i in range(len(clients))}
+            valid = [v for v in val_losses.values() if not math.isnan(v)]
+            if valid:
+                round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
+
+        _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
         if t % 10 == 0:
             _save_checkpoint(output_dir, t, {"thetas": thetas, "round": t})
 
@@ -257,13 +296,24 @@ def _run_federated(
         # Restore last per-client thetas as the broadcast for next round
         server._client_thetas = state["thetas"]
 
-    for t in range(start_round, num_rounds + 1):
+    method_name = type(server).__name__
+    round_pbar  = tqdm(range(start_round, num_rounds + 1), desc=method_name, unit="round")
+    for t in round_pbar:
         t0        = time.time()
         thetas_in = server.broadcast()
         uploads   = {i: clients[i].local_train(thetas_in[i]) for i in range(len(clients))}
         server.aggregate(t, uploads)
+
+        val_losses = None
+        if t % 5 == 0:
+            val_losses = {i: clients[i].compute_val_loss(uploads[i]) for i in range(len(clients))}
+            valid = [v for v in val_losses.values() if not math.isnan(v)]
+            if valid:
+                k = server.cluster_result.num_clusters if server.cluster_result else "?"
+                round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
+
         _log_round(t, num_rounds, uploads, server.cluster_result,
-                   time.time() - t0, log_path)
+                   time.time() - t0, log_path, val_losses)
 
         if t % 10 == 0:
             _save_checkpoint(output_dir, t,
@@ -335,9 +385,11 @@ def parse_args():
     p.add_argument("--mock", action="store_true",
                    help="Use a tiny in-memory model (no download, for testing)")
     # Training
-    p.add_argument("--num-rounds", type=int, default=None,
+    p.add_argument("--num-rounds",   type=int, default=None,
                    help="Override config num_rounds")
-    p.add_argument("--device",     default="cpu")
+    p.add_argument("--local-epochs", type=int, default=None,
+                   help="Local SGD epochs per round (E in FedAvg). Default: 1")
+    p.add_argument("--device",       default="cpu")
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--log-level",  default="INFO")
     return p.parse_args()
@@ -358,6 +410,8 @@ def main():
     cfg = UnifiedEduConfig()
     if args.num_rounds is not None:
         cfg.federation.num_rounds = args.num_rounds
+    if args.local_epochs is not None:
+        cfg.training.local_epochs = args.local_epochs
     cfg.device = args.device
 
     # Load processed splits
@@ -367,6 +421,7 @@ def main():
     if args.mock:
         log.info("Using mock model (--mock flag set)")
         models_and_toks = [_load_mock_model() for _ in client_names]
+        per_client = {name: "mock" for name in client_names}
         # Synthetic samples for smoke test
         synthetic_sample = {
             "sample_id": "s0", "context": "Machine learning optimises a loss function.",
@@ -386,6 +441,7 @@ def main():
             "stanford": args.stanford_model or args.model or "facebook/opt-125m",
             "papers":   args.papers_model   or args.model or "EleutherAI/pythia-160m",
         }
+        log.info("Per-client backbone models: %s", per_client)
         models_and_toks = [
             _load_hf_model(per_client[name], args.device)
             for name in client_names
@@ -398,15 +454,26 @@ def main():
         model, tokenizer = models_and_toks[idx]
         models.append(model)
         clients.append(
-            _make_client(idx, model, tokenizer,
-                         splits[name]["train"], cfg, args.device)
+            _make_client(
+                idx, model, tokenizer,
+                splits[name]["train"],
+                splits[name].get("val", []),
+                per_client[name],
+                cfg, args.device,
+            )
         )
     log.info("Built %d clients: %s", len(clients), client_names)
 
     # Save run config
     with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
-        json.dump({"method": args.method, "num_rounds": cfg.federation.num_rounds,
-                   "clients": client_names, "device": args.device}, f, indent=2)
+        json.dump({
+            "method":       args.method,
+            "num_rounds":   cfg.federation.num_rounds,
+            "local_epochs": cfg.training.local_epochs,
+            "clients":      client_names,
+            "models":       per_client,
+            "device":       args.device,
+        }, f, indent=2)
 
     T = cfg.federation.num_rounds
     log.info("Starting %s training for %d rounds ...", args.method, T)
