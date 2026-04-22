@@ -1,3 +1,263 @@
+// File: c:\Users\fp223\Projects\UnifiedEdu\evaluate.py
+"""
+evaluate.py -- Final evaluation entry point for UnifiedEdu.
+
+Usage
+-----
+python evaluate.py \\
+    --method unifiededu \\
+    --checkpoint-dir runs/exp1 \\
+    --data-dir data/processed \\
+    --output-dir results/exp1 \\
+    --device cpu
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+
+log = logging.getLogger(__name__)
+
+
+def _load_model_and_tokenizer(model_name: str, device: str):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok   = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    return model, tok
+
+
+def _generate_qa_pairs(
+    model,
+    tokenizer,
+    samples:    List[dict],
+    theta_flat: torch.Tensor,
+    k_edge:     int,
+    k_node:     int,
+    device:     str,
+    max_new_tokens: int = 128,
+) -> List[Dict[str, str]]:
+    """Generate (question, answer) pairs for each sample context."""
+    from unifiededu.federation.client import assign_layer_groups, modulate_params
+    from unifiededu.models.gnn_params import theta_from_flat
+    from torch.func import functional_call
+
+    theta  = theta_from_flat(theta_flat.to(device), k_edge, k_node)
+    groups = assign_layer_groups(model, k_edge, k_node)
+    params = modulate_params(model, theta, groups)
+
+    results = []
+    for s in samples:
+        prompt = f"Context: {s['context']}\n\nQuestion: "
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=400,
+            truncation=True,
+        ).to(device)
+
+        with torch.no_grad():
+            out = functional_call(
+                model, params, args=(),
+                kwargs={**inputs, "max_new_tokens": max_new_tokens},
+                strict=False,
+            )
+            # Fallback: call model directly if functional_call doesn't support generate
+            if not hasattr(out, "sequences"):
+                gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+            else:
+                gen_ids = out.sequences
+
+        generated = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+        # Split at "Answer:" if present
+        if "Answer:" in generated:
+            parts = generated.split("Answer:", 1)
+            q_part = parts[0].replace("Question:", "").strip()
+            a_part = parts[1].strip()
+        else:
+            q_part = generated.strip()
+            a_part = ""
+
+        results.append({
+            "sample_id": s["sample_id"],
+            "context":   s["context"],
+            "question":  q_part,
+            "answer":    a_part,
+            "ref_question": s["question"],
+            "ref_answer":   s["answer"],
+        })
+    return results
+
+
+def run_evaluation(
+    generated:      List[Dict[str, str]],
+    output_path:    str,
+    device:         str = "cpu",
+) -> Dict[str, float]:
+    """Run all five evaluation dimensions and save results."""
+    from unifiededu.evaluation import (
+        compute_rquge,
+        compute_faithfulness,
+        compute_qafacteval,
+        compute_rtc,
+        compute_bloom_level,
+        compute_evs,
+    )
+
+    questions = [g["question"] for g in generated]
+    answers   = [g["answer"]   for g in generated]
+    contexts  = [g["context"]  for g in generated]
+
+    log.info("Computing RQUGE...")
+    rquge_scores = compute_rquge(questions, answers, contexts, device=device)
+
+    log.info("Computing Faithfulness...")
+    faith_scores = compute_faithfulness(answers, contexts, device=device)
+
+    log.info("Computing QAFactEval...")
+    qafe_scores  = compute_qafacteval(answers, contexts, device=device)
+
+    log.info("Computing RTC...")
+    rtc_scores   = compute_rtc(questions, answers, contexts, device=device)
+
+    log.info("Computing Bloom's levels...")
+    bloom_levels = compute_bloom_level(questions, method="bert", device=device)
+    evs_scores   = compute_evs(bloom_levels)
+
+    # Aggregate
+    agg = {
+        "rquge_mean":       sum(rquge_scores) / len(rquge_scores),
+        "faithfulness_mean": sum(faith_scores) / len(faith_scores),
+        "qafacteval_mean":  sum(qafe_scores)  / len(qafe_scores),
+        "rtc_mean":         sum(rtc_scores)   / len(rtc_scores),
+        "evs_mean":         sum(evs_scores)   / len(evs_scores),
+        "bloom_mean":       sum(bloom_levels) / len(bloom_levels),
+    }
+
+    # Save per-sample results
+    per_sample = []
+    for i, g in enumerate(generated):
+        per_sample.append({
+            **g,
+            "rquge":       rquge_scores[i],
+            "faithfulness": faith_scores[i],
+            "qafacteval":  qafe_scores[i],
+            "rtc":         rtc_scores[i],
+            "bloom_level": bloom_levels[i],
+            "evs":         evs_scores[i],
+        })
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump({"aggregate": agg, "per_sample": per_sample}, f, indent=2)
+
+    log.info("Results saved to %s", output_path)
+    return agg
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--method",         default="unifiededu")
+    p.add_argument("--checkpoint-dir", default="runs/default")
+    p.add_argument("--data-dir",       default="data/processed")
+    p.add_argument("--output-dir",     default="results/default")
+    p.add_argument("--split",          default="test",
+                   choices=["train", "val", "test"])
+    p.add_argument("--model",          default="distilgpt2")
+    p.add_argument("--device",         default="cpu")
+    p.add_argument("--client",         default=None,
+                   help="Evaluate a specific client only (e.g. 'mit')")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    from unifiededu.config import UnifiedEduConfig
+    from unifiededu.data.preprocessing import load_splits, CLIENT_FILES
+
+    cfg = UnifiedEduConfig()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    client_names = [args.client] if args.client else list(CLIENT_FILES.keys())
+    splits = load_splits(args.data_dir, client_names)
+
+    # Load latest checkpoint
+    ckpts = sorted(Path(args.checkpoint_dir).glob("round_*.pt"))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints found in {args.checkpoint_dir}")
+    state = torch.load(ckpts[-1], map_location="cpu")
+    thetas: Dict = state["thetas"]
+
+    model, tokenizer = _load_model_and_tokenizer(args.model, args.device)
+
+    all_agg = {}
+    for idx, client_name in enumerate(client_names):
+        log.info("Evaluating client: %s", client_name)
+        theta_flat = thetas.get(idx, list(thetas.values())[0])
+        samples    = splits[client_name][args.split]
+
+        generated = _generate_qa_pairs(
+            model, tokenizer, samples, theta_flat,
+            cfg.model_graph.k_edge, cfg.model_graph.k_node,
+            args.device,
+        )
+
+        out_path = os.path.join(
+            args.output_dir,
+            f"{client_name}_{args.split}_{args.method}.json",
+        )
+        agg = run_evaluation(generated, out_path, device=args.device)
+        all_agg[client_name] = agg
+        log.info("%s: %s", client_name, agg)
+        
+    # --- Global test set evaluation ---
+    if "global" in splits:
+        log.info("Evaluating on global test set...")
+        global_samples = splits["global"]["test"]
+
+        # Use the grand-mean Theta (last inter-cluster average)
+        # which is the most general parameter vector
+        grand_theta = torch.stack(list(thetas.values())).mean(dim=0)
+
+        generated_global = _generate_qa_pairs(
+            model, tokenizer, global_samples, grand_theta,
+            cfg.model_graph.k_edge, cfg.model_graph.k_node,
+            args.device,
+        )
+
+        global_out_path = os.path.join(
+            args.output_dir,
+            f"global_test_{args.method}.json",
+        )
+        global_agg = run_evaluation(
+            generated_global, global_out_path, device=args.device
+        )
+        all_agg["global"] = global_agg
+        log.info("Global test: %s", global_agg)
+
+    # Save summary
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(all_agg, f, indent=2)
+    log.info("Summary saved to %s", summary_path)
+
+
+if __name__ == "__main__":
+    main()
+
 // File: c:\Users\fp223\Projects\UnifiedEdu\tests\test_clustering.py
 """
 Smoke tests for federation/clustering.py
@@ -1636,7 +1896,7 @@ def _load_hf_model(model_name: str, device: str):
 def _load_mock_model():
     """Tiny in-memory model for smoke tests (no download needed)."""
     import torch.nn as nn
-    from unifiededu.tests_helpers import _TinyLM, _MockTokenizer  # type: ignore
+    # from unifiededu.tests_helpers import _TinyLM, _MockTokenizer  # type: ignore
 
     # Inline the minimal classes so train.py has no test dependency
     VOCAB = 64
@@ -2985,17 +3245,18 @@ def load_jsonl(path: str) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 def prepare_all(
-    data_dir:           str  = ".",
-    output_dir:         str  = "data/processed",
-    seed:               int  = 42,
-    train_ratio:        float = 0.80,
-    val_ratio:          float = 0.10,
-    min_anchor_chunks:  int  = 20,
-    min_iid_distance:   float = 0.15,
-    embed:              bool = True,
-    embedding_model:    str  = "sentence-transformers/all-MiniLM-L6-v2",
-    embedding_device:   str  = "cpu",
-    plot_tsne_path:     Optional[str] = None,
+    data_dir:              str   = ".",
+    output_dir:            str   = "data/processed",
+    seed:                  int   = 42,
+    train_ratio:           float = 0.80,
+    val_ratio:             float = 0.10,
+    min_anchor_chunks:     int   = 20,
+    min_iid_distance:      float = 0.15,
+    embed:                 bool  = True,
+    embedding_model:       str   = "sentence-transformers/all-MiniLM-L6-v2",
+    embedding_device:      str   = "cpu",
+    plot_tsne_path:        Optional[str] = None,
+    global_test_strategy:  str   = "all",   # <-- new parameter
 ) -> Dict[str, Dict[str, List[dict]]]:
     """
     Full preprocessing pipeline.
@@ -3003,6 +3264,7 @@ def prepare_all(
     Returns
     -------
     Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    Also writes global_test.jsonl to output_dir.
     """
     rng = random.Random(seed)
 
@@ -3077,6 +3339,16 @@ def prepare_all(
         for split_name, samples in split_dict.items():
             out_path = os.path.join(output_dir, f"{client_name}_{split_name}.jsonl")
             save_jsonl(samples, out_path)
+            
+            
+    # --- NEW: build global test set ----------------------------------------
+    global_test = build_global_test_set(
+        per_client_splits=splits,
+        output_dir=output_dir,
+        seed=seed,
+        strategy=global_test_strategy,
+    )
+    log.info("Global test set size: %d", len(global_test))
 
     log.info("Preprocessing complete. Output dir: %s", output_dir)
     return splits
@@ -3087,13 +3359,17 @@ def prepare_all(
 # ---------------------------------------------------------------------------
 
 def load_splits(
-    output_dir:  str,
+    output_dir:   str,
     client_names: Optional[List[str]] = None,
+    load_global_test: bool = True,
 ) -> Dict[str, Dict[str, List[dict]]]:
     """
     Load JSONL files previously written by prepare_all().
 
-    Returns Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    Returns
+    -------
+    Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    Plus an optional "global" key: {"test": [...]}
     """
     names = client_names or list(CLIENT_FILES.keys())
     result = {}
@@ -3102,8 +3378,109 @@ def load_splits(
         for split in ("train", "val", "test"):
             path = os.path.join(output_dir, f"{client_name}_{split}.jsonl")
             result[client_name][split] = load_jsonl(path)
+
+    # Load global test set if it exists
+    if load_global_test:
+        global_path = os.path.join(output_dir, "global_test.jsonl")
+        if os.path.exists(global_path):
+            result["global"] = {"test": load_jsonl(global_path)}
+            log.info(
+                "Loaded global test set: %d samples",
+                len(result["global"]["test"]),
+            )
+        else:
+            log.warning(
+                "global_test.jsonl not found in %s. "
+                "Run prepare_all() to generate it.",
+                output_dir,
+            )
+
     return result
 
+def build_global_test_set(
+    per_client_splits: Dict[str, Dict[str, List[dict]]],
+    output_dir: str,
+    seed: int = 42,
+    strategy: str = "all",          # "all" | "equal" | "anchor_only"
+    samples_per_client: int = None,  # used when strategy="equal"
+) -> List[dict]:
+    """
+    Build a global test set by combining the test splits of all clients.
+
+    Parameters
+    ----------
+    per_client_splits : output of prepare_all() or load_splits()
+    output_dir        : where to write global_test.jsonl
+    seed              : random seed for shuffling
+    strategy          : how to combine client test sets
+        "all"         -- concatenate all three test sets as-is (default)
+        "equal"       -- sample equal numbers from each client's test set
+        "anchor_only" -- only include samples that hit at least one anchor topic
+    samples_per_client: used when strategy="equal"; if None, uses min test size
+
+    Returns
+    -------
+    List of sample dicts (also written to global_test.jsonl)
+    """
+    rng = random.Random(seed)
+
+    client_test_sets = {
+        name: splits["test"]
+        for name, splits in per_client_splits.items()
+    }
+
+    if strategy == "all":
+        # Concatenate all test sets; tag each sample with its source client
+        combined = []
+        for client_name, samples in client_test_sets.items():
+            for s in samples:
+                tagged = dict(s)
+                tagged["source_client"] = client_name
+                combined.append(tagged)
+
+    elif strategy == "equal":
+        # Sample equal numbers from each client
+        n = samples_per_client or min(len(v) for v in client_test_sets.values())
+        combined = []
+        for client_name, samples in client_test_sets.items():
+            pool = list(samples)
+            rng.shuffle(pool)
+            for s in pool[:n]:
+                tagged = dict(s)
+                tagged["source_client"] = client_name
+                combined.append(tagged)
+
+    elif strategy == "anchor_only":
+        # Only include samples covering at least one anchor topic
+        combined = []
+        for client_name, samples in client_test_sets.items():
+            for s in samples:
+                hits = _anchor_hits(s["context"] + " " + s["question"])
+                if hits:
+                    tagged = dict(s)
+                    tagged["source_client"] = client_name
+                    tagged["anchor_topics"] = hits
+                    combined.append(tagged)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy!r}")
+
+    rng.shuffle(combined)
+
+    out_path = os.path.join(output_dir, "global_test.jsonl")
+    save_jsonl(combined, out_path)
+
+    log.info(
+        "Global test set: %d samples from %d clients -> %s",
+        len(combined), len(client_test_sets), out_path,
+    )
+
+    # Log per-client breakdown
+    from collections import Counter
+    counts = Counter(s["source_client"] for s in combined)
+    for client_name, count in sorted(counts.items()):
+        log.info("  %s: %d samples", client_name, count)
+
+    return combined
 
 // File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\data\__init__.py
 from .preprocessing import (
@@ -3121,8 +3498,877 @@ __all__ = [
 ]
 
 
-// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\__init__.py
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\blooms.py
+"""
+evaluation/blooms.py
 
+Bloom's Taxonomy classification and Educational Value Score (EVS).
+
+Two methods:
+  1. BERT-based classifier (fine-tuned on annotated questions)
+  2. LLM judge with structured JSON output
+
+EVS = (bloom_level - 1) / 5  in [0, 1]
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import List, Optional, Tuple
+
+log = logging.getLogger(__name__)
+
+BLOOM_LEVELS = {
+    1: "Remember",
+    2: "Understand",
+    3: "Apply",
+    4: "Analyse",
+    5: "Evaluate",
+    6: "Create",
+}
+
+_bert_classifier = None
+_bert_tokenizer  = None
+
+
+def _load_bert_classifier(
+    model_name: str = "facebook/bart-large-mnli",
+    device: str = "cpu",
+):
+    """
+    Load a zero-shot classifier as a proxy for Bloom's level classification.
+    Replace model_name with a fine-tuned Bloom's BERT checkpoint when available.
+    """
+    global _bert_classifier, _bert_tokenizer
+    if _bert_classifier is None:
+        from transformers import pipeline
+        log.info("Loading Bloom's classifier (%s)...", model_name)
+        _bert_classifier = pipeline(
+            "zero-shot-classification",
+            model=model_name,
+            device=0 if device == "cuda" else -1,
+        )
+    return _bert_classifier
+
+
+def compute_bloom_level_bert(
+    questions: List[str],
+    device:    str = "cpu",
+) -> List[int]:
+    """
+    Classify each question into a Bloom's level [1, 6] using a
+    zero-shot BART-based classifier.
+
+    Returns
+    -------
+    List of int in [1, 6].
+    """
+    classifier = _load_bert_classifier(device=device)
+    candidate_labels = [f"Level {k}: {v}" for k, v in BLOOM_LEVELS.items()]
+
+    levels = []
+    for q in questions:
+        result = classifier(q, candidate_labels, multi_label=False)
+        top_label = result["labels"][0]
+        # Extract level number from label string "Level N:..."
+        try:
+            level = int(top_label.split(":")[0].split()[-1])
+        except (ValueError, IndexError):
+            level = 1
+        levels.append(max(1, min(6, level)))
+    return levels
+
+
+def compute_bloom_level_llm(
+    questions:  List[str],
+    course:     str = "machine learning",
+    model_name: str = "gpt-3.5-turbo",
+    api_key:    Optional[str] = None,
+) -> List[Tuple[int, str]]:
+    """
+    Classify each question using an LLM judge with structured JSON output.
+
+    Returns
+    -------
+    List of (level: int, reason: str) tuples.
+    """
+    try:
+        import openai
+        if api_key:
+            openai.api_key = api_key
+    except ImportError:
+        log.warning("openai package not found; returning level=1 for all questions.")
+        return [(1, "openai not available")] * len(questions)
+
+    bloom_desc = "\n".join(
+        f"  {k}: {v}" for k, v in BLOOM_LEVELS.items()
+    )
+    results = []
+    for q in questions:
+        prompt = (
+            f"You are an expert in educational assessment for a {course} course.\n"
+            f"Classify the following question according to Bloom's Revised Taxonomy:\n\n"
+            f"Question: {q}\n\n"
+            f"Bloom's levels:\n{bloom_desc}\n\n"
+            f"Respond ONLY with valid JSON: "
+            f'{{ "level": <int 1-6>, "reason": "<brief justification>" }}'
+        )
+        try:
+            response = openai.ChatCompletion.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=100,
+            )
+            raw = response.choices[0].message.content.strip()
+            parsed = json.loads(raw)
+            level  = max(1, min(6, int(parsed.get("level", 1))))
+            reason = str(parsed.get("reason", ""))
+            results.append((level, reason))
+        except Exception as e:
+            log.warning("LLM Bloom's judge failed: %s", e)
+            results.append((1, "error"))
+    return results
+
+
+def compute_bloom_level(
+    questions: List[str],
+    method:    str = "bert",
+    device:    str = "cpu",
+    **kwargs,
+) -> List[int]:
+    """
+    Unified interface. method in {"bert", "llm"}.
+    Returns list of int in [1, 6].
+    """
+    if method == "llm":
+        pairs = compute_bloom_level_llm(questions, **kwargs)
+        return [p[0] for p in pairs]
+    return compute_bloom_level_bert(questions, device=device)
+
+
+def compute_evs(bloom_levels: List[int]) -> List[float]:
+    """
+    Educational Value Score: EVS(q) = (b - 1) / 5 in [0, 1].
+    """
+    return [(b - 1) / 5.0 for b in bloom_levels]
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\equit.py
+"""
+evaluation/equity.py
+
+Equity metrics:
+  - Curricular Richness C_k
+  - Pairwise Equity Score E_{kl}^{(m)}
+  - Knowledge Transfer Index KTI(l <- k)
+  - Anchor Question Equity Score
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+log = logging.getLogger(__name__)
+
+EPSILON = 1e-6
+
+
+def curricular_richness(
+    samples:     List[dict],
+    max_pages:   int,
+    alpha:       Tuple[float, float, float] = (0.33, 0.34, 0.33),
+) -> float:
+    """
+    Compute curricular richness score C_k in [0, 1].
+
+    C_k = alpha_1 * (|D_k| / |D_max|)
+        + alpha_2 * Diversity(D_k)
+        + alpha_3 * Quality(D_k)
+
+    Parameters
+    ----------
+    samples   : list of sample dicts (must have 'embedding' and 'metadata' keys)
+    max_pages : total pages in the largest dataset (for normalisation)
+    alpha     : weights (alpha_1, alpha_2, alpha_3), must sum to 1
+
+    Returns
+    -------
+    float in [0, 1]
+    """
+    alpha_1, alpha_2, alpha_3 = alpha
+
+    # Component 1: size
+    n_pages = len(samples)
+    size_score = min(1.0, n_pages / max(1, max_pages))
+
+    # Component 2: diversity (avg pairwise cosine distance of embeddings)
+    embs = [s.get("embedding", []) for s in samples if s.get("embedding")]
+    if len(embs) >= 2:
+        embs_arr = np.array(embs, dtype=np.float32)
+        # Normalise
+        norms = np.linalg.norm(embs_arr, axis=1, keepdims=True) + 1e-9
+        embs_norm = embs_arr / norms
+        # Sample up to 500 for efficiency
+        idx = np.random.choice(len(embs_norm), min(500, len(embs_norm)), replace=False)
+        sub = embs_norm[idx]
+        sim_matrix = sub @ sub.T
+        # Cosine distance = 1 - cosine similarity
+        n = len(sub)
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        diversity_score = float((1 - sim_matrix[mask]).mean())
+    else:
+        diversity_score = 0.0
+
+    # Component 3: quality proxy (source type)
+    source_scores = {
+        "paper": 1.0, "publication": 1.0,
+        "textbook": 0.7,
+        "lecture": 0.4, "slides": 0.4, "notes": 0.4,
+        "assignment": 0.3,
+    }
+    quality_vals = []
+    for s in samples:
+        src = str(s.get("metadata", {}).get("source_type", "")).lower()
+        score = 0.4  # default
+        for key, val in source_scores.items():
+            if key in src:
+                score = val
+                break
+        quality_vals.append(score)
+    quality_score = float(np.mean(quality_vals)) if quality_vals else 0.4
+
+    return (
+        alpha_1 * size_score
+        + alpha_2 * diversity_score
+        + alpha_3 * quality_score
+    )
+
+
+def compute_pairwise_equity(
+    quality_k: float,
+    quality_l: float,
+    richness_k: float,
+    richness_l: float,
+    resource_k: float,
+    resource_l: float,
+    epsilon:    float = EPSILON,
+) -> float:
+    """
+    Pairwise Equity Score E_{kl}^{(m)}.
+
+    E_{kl} = (Q_k + Q_l) / (|C_k - C_l| + |R_k - R_l| + epsilon)
+
+    Returns
+    -------
+    float (higher = more equitable)
+    """
+    numerator   = quality_k + quality_l
+    denominator = abs(richness_k - richness_l) + abs(resource_k - resource_l) + epsilon
+    return numerator / denominator
+
+
+def compute_kti(
+    quality_uni_on_exclusive:   float,
+    quality_indiv_on_exclusive: float,
+) -> float:
+    """
+    Knowledge Transfer Index KTI(l <- k).
+
+    KTI = Q_l^{uni}(T_{k\\l}) - Q_l^{indiv}(T_{k\\l})
+
+    A positive value indicates genuine knowledge transfer from k to l
+    on topics exclusive to k's curriculum.
+
+    Parameters
+    ----------
+    quality_uni_on_exclusive   : Q_l^{uni} evaluated on T_{k\\l}
+    quality_indiv_on_exclusive : Q_l^{indiv} evaluated on T_{k\\l}
+
+    Returns
+    -------
+    float (positive = knowledge transferred)
+    """
+    return quality_uni_on_exclusive - quality_indiv_on_exclusive
+
+
+def compute_anchor_equity(
+    score_k_indiv: float,
+    score_l_indiv: float,
+    score_l_uni:   float,
+    tolerance:     float = 0.05,
+) -> Dict[str, float]:
+    """
+    Anchor Question Equity evaluation.
+
+    Tests the hypothesis:
+        s_l^{uni} ≈ s_k^{indiv} > s_l^{indiv}
+
+    Parameters
+    ----------
+    score_k_indiv : correctness score of resource-rich institution k
+                    under individual training
+    score_l_indiv : correctness score of resource-constrained institution l
+                    under individual training
+    score_l_uni   : correctness score of institution l after UnifiedEdu
+    tolerance     : how close s_l^{uni} must be to s_k^{indiv} to count
+                    as "approximately equal"
+
+    Returns
+    -------
+    dict with keys:
+        gap_closed  : float  -- (s_l^{uni} - s_l^{indiv}) / max(s_k^{indiv} - s_l^{indiv}, epsilon)
+        hypothesis_met : bool
+        scores      : dict of the three input scores
+    """
+    original_gap = score_k_indiv - score_l_indiv
+    gap_closed   = (score_l_uni - score_l_indiv) / max(original_gap, EPSILON)
+
+    hypothesis_met = (
+        abs(score_l_uni - score_k_indiv) <= tolerance
+        and score_k_indiv > score_l_indiv
+    )
+
+    return {
+        "gap_closed":       gap_closed,
+        "hypothesis_met":   hypothesis_met,
+        "score_k_indiv":    score_k_indiv,
+        "score_l_indiv":    score_l_indiv,
+        "score_l_uni":      score_l_uni,
+        "original_gap":     original_gap,
+    }
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\faithfulness.py
+"""
+evaluation/faithfulness.py
+
+NLI-based RAGAS Faithfulness (Section 7.2 of the paper).
+
+Replaces the LLM verifier with DeBERTa-large-mnli so that the
+faithfulness check is deterministic and hallucination-free.
+
+Score in [0, 1]: fraction of atomic claims entailed by the context.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import List
+
+log = logging.getLogger(__name__)
+
+_claim_splitter = None
+_nli_model      = None
+_nli_tokenizer  = None
+
+
+def _load_nli(device: str = "cpu"):
+    global _nli_model, _nli_tokenizer
+    if _nli_model is None:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        model_name = "cross-encoder/nli-deberta-v3-large"
+        log.info("Loading NLI model %s...", model_name)
+        _nli_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _nli_model     = AutoModelForSequenceClassification.from_pretrained(
+            model_name
+        ).to(device)
+        _nli_model.eval()
+    return _nli_model, _nli_tokenizer
+
+
+def _split_into_claims(text: str) -> List[str]:
+    """
+    Split answer text into atomic claims.
+
+    Uses simple sentence splitting as a lightweight alternative to
+    an LLM-based semantic parser.  Each sentence is treated as one claim.
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _is_entailed(context: str, claim: str, device: str = "cpu") -> bool:
+    """Return True if context entails claim according to the NLI model."""
+    import torch
+    model, tokenizer = _load_nli(device)
+    inputs = tokenizer(
+        context, claim,
+        return_tensors="pt",
+        max_length=512,
+        truncation=True,
+        padding=True,
+    ).to(device)
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    # Label order for cross-encoder/nli: 0=contradiction, 1=neutral, 2=entailment
+    pred = logits.argmax(dim=-1).item()
+    return pred == 2
+
+
+def compute_faithfulness(
+    answers:  List[str],
+    contexts: List[str],
+    device:   str = "cpu",
+) -> List[float]:
+    """
+    Compute NLI-based faithfulness for each (answer, context) pair.
+
+    Returns
+    -------
+    List of float in [0, 1].
+    """
+    scores = []
+    for a, c in zip(answers, contexts):
+        claims = _split_into_claims(a)
+        if not claims:
+            scores.append(0.0)
+            continue
+        entailed = sum(1 for s in claims if _is_entailed(c, s, device=device))
+        scores.append(entailed / len(claims))
+    return scores
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\qafacteval.py
+"""
+evaluation/qafacteval.py
+
+QAFactEval: QA-based factual consistency score.
+Uses a QA model to verify whether answer spans can be recovered
+from the context, scored by token-F1 (LERC approximation).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import List
+
+log = logging.getLogger(__name__)
+
+
+def _generate_internal_qa_pairs(
+    answer: str,
+    n: int = 3,
+) -> List[str]:
+    """
+    Extract n key spans from the answer as internal questions.
+    Simple heuristic: split into sentences and use each as a question.
+    """
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', answer.strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    # Convert to cloze-style questions
+    questions = []
+    for sent in sentences[:n]:
+        words = sent.split()
+        if len(words) > 3:
+            # Blank out the last noun-like word as the answer span
+            questions.append(" ".join(words[:-1]) + " ___?")
+        else:
+            questions.append(sent + "?")
+    return questions[:n] if questions else [answer[:50] + "?"]
+
+
+def _token_f1(pred: str, gold: str) -> float:
+    pred_toks = set(pred.lower().split())
+    gold_toks = set(gold.lower().split())
+    if not pred_toks or not gold_toks:
+        return 0.0
+    common = pred_toks & gold_toks
+    if not common:
+        return 0.0
+    p = len(common) / len(pred_toks)
+    r = len(common) / len(gold_toks)
+    return 2 * p * r / (p + r)
+
+
+def compute_qafacteval(
+    answers:  List[str],
+    contexts: List[str],
+    device:   str = "cpu",
+    n:        int = 3,
+) -> List[float]:
+    """
+    Compute QAFactEval score for each (answer, context) pair.
+
+    Returns
+    -------
+    List of float in [0, 1].
+    """
+    from.rquge import _answer_question
+
+    scores = []
+    for a, c in zip(answers, contexts):
+        internal_qs = _generate_internal_qa_pairs(a, n=n)
+        pair_scores = []
+        for q_int in internal_qs:
+            # Gold span: extract from answer
+            gold_span = a.split()[-3:] if a.split() else [""]
+            gold_span = " ".join(gold_span)
+            # Predicted span: QA model reads context
+            pred_span = _answer_question(q_int, c, device=device)
+            pair_scores.append(_token_f1(pred_span, gold_span))
+        scores.append(sum(pair_scores) / len(pair_scores) if pair_scores else 0.0)
+    return scores
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\rquge.py
+"""
+evaluation/rquge.py
+
+RQUGE: Reference-free QUestion Generation Evaluation.
+
+Score range: [1, 5].
+a_c = QA(q, c)          -- UnifiedQAv2 answers the question given context
+kappa = S(q, a_c, a, c) -- RoBERTa-based MOCHA scorer
+
+In our setting the generated answer a serves as the gold span a_r.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import List, Optional
+
+log = logging.getLogger(__name__)
+
+_qa_model    = None
+_qa_tokenizer = None
+_scorer      = None
+
+
+def _load_qa_model(device: str = "cpu"):
+    global _qa_model, _qa_tokenizer
+    if _qa_model is None:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        model_name = "allenai/unifiedqa-v2-t5-large-1251000"
+        log.info("Loading UnifiedQAv2 from %s...", model_name)
+        _qa_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _qa_model     = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+        _qa_model.eval()
+    return _qa_model, _qa_tokenizer
+
+
+def _load_scorer(device: str = "cpu"):
+    """
+    RQUGE scorer: RoBERTa fine-tuned on MOCHA.
+    We use the rquge package if available, else fall back to a
+    token-F1 approximation between a_c and a_r.
+    """
+    global _scorer
+    if _scorer is None:
+        try:
+            from rquge_score import RQUGE
+            _scorer = RQUGE(device=device)
+            log.info("Loaded RQUGE scorer.")
+        except ImportError:
+            log.warning(
+                "rquge_score package not found. "
+                "Falling back to token-F1 as RQUGE approximation."
+            )
+            _scorer = "token_f1"
+    return _scorer
+
+
+def _token_f1(pred: str, gold: str) -> float:
+    """Token-level F1 between two strings (fallback scorer)."""
+    pred_toks = set(pred.lower().split())
+    gold_toks = set(gold.lower().split())
+    if not pred_toks or not gold_toks:
+        return 0.0
+    common = pred_toks & gold_toks
+    if not common:
+        return 0.0
+    p = len(common) / len(pred_toks)
+    r = len(common) / len(gold_toks)
+    return 2 * p * r / (p + r)
+
+
+def _answer_question(question: str, context: str, device: str = "cpu") -> str:
+    """Run UnifiedQAv2 to answer `question` given `context`."""
+    model, tokenizer = _load_qa_model(device)
+    import torch
+    input_text = f"{question} \\n {context}"
+    inputs = tokenizer(
+        input_text,
+        return_tensors="pt",
+        max_length=512,
+        truncation=True,
+    ).to(device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=64)
+    return tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
+
+def compute_rquge(
+    questions: List[str],
+    answers:   List[str],
+    contexts:  List[str],
+    device:    str = "cpu",
+) -> List[float]:
+    """
+    Compute RQUGE score for each (question, answer, context) triple.
+
+    Parameters
+    ----------
+    questions : list of generated questions
+    answers   : list of generated answers (used as gold span a_r)
+    contexts  : list of source contexts
+
+    Returns
+    -------
+    List of float scores in [1, 5] (or [0, 1] if using token-F1 fallback).
+    """
+    scorer = _load_scorer(device)
+    scores = []
+
+    for q, a, c in zip(questions, answers, contexts):
+        a_c = _answer_question(q, c, device=device)
+
+        if scorer == "token_f1":
+            # Scale token-F1 from [0,1] to [1,5]
+            f1 = _token_f1(a_c, a)
+            scores.append(1.0 + 4.0 * f1)
+        else:
+            try:
+                kappa = scorer.score(
+                    question=q,
+                    candidate_answer=a_c,
+                    reference_answer=a,
+                    context=c,
+                )
+                scores.append(float(kappa))
+            except Exception as e:
+                log.warning("RQUGE scorer failed for sample: %s", e)
+                f1 = _token_f1(a_c, a)
+                scores.append(1.0 + 4.0 * f1)
+
+    return scores
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\rtc.py
+"""
+evaluation/rtc.py
+
+Round-Trip Consistency (RTC): token-level F1 between
+QA(q, c) and the generated answer a.
+"""
+
+from __future__ import annotations
+
+from typing import List
+
+
+def _token_f1(pred: str, gold: str) -> float:
+    pred_toks = set(pred.lower().split())
+    gold_toks = set(gold.lower().split())
+    if not pred_toks or not gold_toks:
+        return 0.0
+    common = pred_toks & gold_toks
+    if not common:
+        return 0.0
+    p = len(common) / len(pred_toks)
+    r = len(common) / len(gold_toks)
+    return 2 * p * r / (p + r)
+
+
+def compute_rtc(
+    questions: List[str],
+    answers:   List[str],
+    contexts:  List[str],
+    device:    str = "cpu",
+) -> List[float]:
+    """
+    Compute Round-Trip Consistency for each (question, answer, context).
+
+    RTC(q, a, c) = token_F1(QA(q, c), a)
+
+    Returns
+    -------
+    List of float in [0, 1].
+    """
+    from.rquge import _answer_question
+
+    scores = []
+    for q, a, c in zip(questions, answers, contexts):
+        a_c = _answer_question(q, c, device=device)
+        scores.append(_token_f1(a_c, a))
+    return scores
+
+
+def compute_answer_relevancy(
+    questions: List[str],
+    answers:   List[str],
+    n_reverse: int = 3,
+    device:    str = "cpu",
+) -> List[float]:
+    """
+    RAGAS Answer Relevancy: cosine similarity between
+    embed(q) and mean embed(reverse_questions from a).
+
+    Returns
+    -------
+    List of float in [-1, 1] (typically [0, 1]).
+    """
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        device=device,
+    )
+
+    scores = []
+    for q, a in zip(questions, answers):
+        # Generate reverse questions from the answer
+        words = a.split()
+        reverse_qs = []
+        chunk = max(1, len(words) // n_reverse)
+        for i in range(n_reverse):
+            span = " ".join(words[i * chunk: (i + 1) * chunk])
+            reverse_qs.append(f"What is {span}?")
+
+        q_emb   = model.encode([q],          convert_to_tensor=True)
+        rq_embs = model.encode(reverse_qs,   convert_to_tensor=True)
+
+        q_norm  = torch.nn.functional.normalize(q_emb,   dim=-1)
+        rq_norm = torch.nn.functional.normalize(rq_embs, dim=-1)
+
+        sim = (q_norm * rq_norm).sum(dim=-1).mean().item()
+        scores.append(float(sim))
+
+    return scores
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\statistical.py
+"""
+evaluation/statistical.py
+
+Statistical validation utilities:
+  - Paired Wilcoxon signed-rank test with Bonferroni correction
+  - Bootstrap confidence intervals
+  - Cohen's d effect size
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy import stats
+
+
+def wilcoxon_test(
+    scores_indiv: List[float],
+    scores_uni:   List[float],
+    alpha:        float = 0.05,
+) -> Dict[str, float]:
+    """
+    Paired Wilcoxon signed-rank test:
+        H0: mu_{uni} = mu_{indiv}
+        H1: mu_{uni} > mu_{indiv}  (one-sided)
+
+    Parameters
+    ----------
+    scores_indiv : per-sample quality scores under individual training
+    scores_uni   : per-sample quality scores under UnifiedEdu
+
+    Returns
+    -------
+    dict with keys: statistic, p_value, significant, cohens_d
+    """
+    a = np.array(scores_indiv, dtype=float)
+    b = np.array(scores_uni,   dtype=float)
+
+    if len(a) < 2 or len(b) < 2:
+        return {"statistic": 0.0, "p_value": 1.0, "significant": False, "cohens_d": 0.0}
+
+    stat, p_two = stats.wilcoxon(a, b, alternative="less")
+    # alternative="less" tests H1: a < b, i.e. indiv < uni
+    significant = p_two < alpha
+
+    # Cohen's d
+    diff = b - a
+    d = float(diff.mean() / (diff.std() + 1e-9))
+
+    return {
+        "statistic":   float(stat),
+        "p_value":     float(p_two),
+        "significant": significant,
+        "cohens_d":    d,
+    }
+
+
+def bonferroni_correction(
+    p_values: List[float],
+    alpha:    float = 0.05,
+) -> Tuple[List[float], List[bool]]:
+    """
+    Apply Bonferroni correction to a list of p-values.
+
+    Returns
+    -------
+    (corrected_p_values, reject_null_list)
+    """
+    n = len(p_values)
+    corrected = [min(1.0, p * n) for p in p_values]
+    reject    = [p < alpha for p in corrected]
+    return corrected, reject
+
+
+def bootstrap_ci(
+    scores:      List[float],
+    n_bootstrap: int   = 10_000,
+    ci:          float = 0.95,
+    seed:        int   = 42,
+) -> Tuple[float, float, float]:
+    """
+    Bootstrap confidence interval for the mean.
+
+    Returns
+    -------
+    (mean, lower_bound, upper_bound)
+    """
+    rng = np.random.default_rng(seed)
+    arr = np.array(scores, dtype=float)
+    means = np.array([
+        rng.choice(arr, size=len(arr), replace=True).mean()
+        for _ in range(n_bootstrap)
+    ])
+    alpha = (1.0 - ci) / 2.0
+    lo = float(np.percentile(means, 100 * alpha))
+    hi = float(np.percentile(means, 100 * (1 - alpha)))
+    return float(arr.mean()), lo, hi
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\__init__.py
+# unifiededu/evaluation/__init__.py
+
+from.rquge import compute_rquge
+from.faithfulness import compute_faithfulness
+from.qafacteval import compute_qafacteval
+from.rtc import compute_rtc
+from.blooms import compute_bloom_level, compute_evs
+from.equity import (
+    compute_pairwise_equity,
+    compute_kti,
+    compute_anchor_equity,
+    curricular_richness,
+)
+from.statistical import wilcoxon_test, bootstrap_ci
+
+__all__ = [
+    "compute_rquge",
+    "compute_faithfulness",
+    "compute_qafacteval",
+    "compute_rtc",
+    "compute_bloom_level",
+    "compute_evs",
+    "compute_pairwise_equity",
+    "compute_kti",
+    "compute_anchor_equity",
+    "curricular_richness",
+    "wilcoxon_test",
+    "bootstrap_ci",
+]
 
 // File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\federation\client.py
 """

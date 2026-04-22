@@ -511,17 +511,18 @@ def load_jsonl(path: str) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 def prepare_all(
-    data_dir:           str  = ".",
-    output_dir:         str  = "data/processed",
-    seed:               int  = 42,
-    train_ratio:        float = 0.80,
-    val_ratio:          float = 0.10,
-    min_anchor_chunks:  int  = 20,
-    min_iid_distance:   float = 0.15,
-    embed:              bool = True,
-    embedding_model:    str  = "sentence-transformers/all-MiniLM-L6-v2",
-    embedding_device:   str  = "cpu",
-    plot_tsne_path:     Optional[str] = None,
+    data_dir:              str   = ".",
+    output_dir:            str   = "data/processed",
+    seed:                  int   = 42,
+    train_ratio:           float = 0.80,
+    val_ratio:             float = 0.10,
+    min_anchor_chunks:     int   = 20,
+    min_iid_distance:      float = 0.15,
+    embed:                 bool  = True,
+    embedding_model:       str   = "sentence-transformers/all-MiniLM-L6-v2",
+    embedding_device:      str   = "cpu",
+    plot_tsne_path:        Optional[str] = None,
+    global_test_strategy:  str   = "all",   # <-- new parameter
 ) -> Dict[str, Dict[str, List[dict]]]:
     """
     Full preprocessing pipeline.
@@ -529,6 +530,7 @@ def prepare_all(
     Returns
     -------
     Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    Also writes global_test.jsonl to output_dir.
     """
     rng = random.Random(seed)
 
@@ -603,6 +605,16 @@ def prepare_all(
         for split_name, samples in split_dict.items():
             out_path = os.path.join(output_dir, f"{client_name}_{split_name}.jsonl")
             save_jsonl(samples, out_path)
+            
+            
+    # --- NEW: build global test set ----------------------------------------
+    global_test = build_global_test_set(
+        per_client_splits=splits,
+        output_dir=output_dir,
+        seed=seed,
+        strategy=global_test_strategy,
+    )
+    log.info("Global test set size: %d", len(global_test))
 
     log.info("Preprocessing complete. Output dir: %s", output_dir)
     return splits
@@ -613,13 +625,17 @@ def prepare_all(
 # ---------------------------------------------------------------------------
 
 def load_splits(
-    output_dir:  str,
+    output_dir:   str,
     client_names: Optional[List[str]] = None,
+    load_global_test: bool = True,
 ) -> Dict[str, Dict[str, List[dict]]]:
     """
     Load JSONL files previously written by prepare_all().
 
-    Returns Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    Returns
+    -------
+    Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    Plus an optional "global" key: {"test": [...]}
     """
     names = client_names or list(CLIENT_FILES.keys())
     result = {}
@@ -628,4 +644,106 @@ def load_splits(
         for split in ("train", "val", "test"):
             path = os.path.join(output_dir, f"{client_name}_{split}.jsonl")
             result[client_name][split] = load_jsonl(path)
+
+    # Load global test set if it exists
+    if load_global_test:
+        global_path = os.path.join(output_dir, "global_test.jsonl")
+        if os.path.exists(global_path):
+            result["global"] = {"test": load_jsonl(global_path)}
+            log.info(
+                "Loaded global test set: %d samples",
+                len(result["global"]["test"]),
+            )
+        else:
+            log.warning(
+                "global_test.jsonl not found in %s. "
+                "Run prepare_all() to generate it.",
+                output_dir,
+            )
+
     return result
+
+def build_global_test_set(
+    per_client_splits: Dict[str, Dict[str, List[dict]]],
+    output_dir: str,
+    seed: int = 42,
+    strategy: str = "all",          # "all" | "equal" | "anchor_only"
+    samples_per_client: int = None,  # used when strategy="equal"
+) -> List[dict]:
+    """
+    Build a global test set by combining the test splits of all clients.
+
+    Parameters
+    ----------
+    per_client_splits : output of prepare_all() or load_splits()
+    output_dir        : where to write global_test.jsonl
+    seed              : random seed for shuffling
+    strategy          : how to combine client test sets
+        "all"         -- concatenate all three test sets as-is (default)
+        "equal"       -- sample equal numbers from each client's test set
+        "anchor_only" -- only include samples that hit at least one anchor topic
+    samples_per_client: used when strategy="equal"; if None, uses min test size
+
+    Returns
+    -------
+    List of sample dicts (also written to global_test.jsonl)
+    """
+    rng = random.Random(seed)
+
+    client_test_sets = {
+        name: splits["test"]
+        for name, splits in per_client_splits.items()
+    }
+
+    if strategy == "all":
+        # Concatenate all test sets; tag each sample with its source client
+        combined = []
+        for client_name, samples in client_test_sets.items():
+            for s in samples:
+                tagged = dict(s)
+                tagged["source_client"] = client_name
+                combined.append(tagged)
+
+    elif strategy == "equal":
+        # Sample equal numbers from each client
+        n = samples_per_client or min(len(v) for v in client_test_sets.values())
+        combined = []
+        for client_name, samples in client_test_sets.items():
+            pool = list(samples)
+            rng.shuffle(pool)
+            for s in pool[:n]:
+                tagged = dict(s)
+                tagged["source_client"] = client_name
+                combined.append(tagged)
+
+    elif strategy == "anchor_only":
+        # Only include samples covering at least one anchor topic
+        combined = []
+        for client_name, samples in client_test_sets.items():
+            for s in samples:
+                hits = _anchor_hits(s["context"] + " " + s["question"])
+                if hits:
+                    tagged = dict(s)
+                    tagged["source_client"] = client_name
+                    tagged["anchor_topics"] = hits
+                    combined.append(tagged)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy!r}")
+
+    rng.shuffle(combined)
+
+    out_path = os.path.join(output_dir, "global_test.jsonl")
+    save_jsonl(combined, out_path)
+
+    log.info(
+        "Global test set: %d samples from %d clients -> %s",
+        len(combined), len(client_test_sets), out_path,
+    )
+
+    # Log per-client breakdown
+    from collections import Counter
+    counts = Counter(s["source_client"] for s in combined)
+    for client_name, count in sorted(counts.items()):
+        log.info("  %s: %d samples", client_name, count)
+
+    return combined

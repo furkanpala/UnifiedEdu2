@@ -167,13 +167,13 @@ def apply_theta_to_graph(
 def theta_from_flat(flat: torch.Tensor, k_edge: int, k_node: int) -> ThetaVector:
     """
     Reconstruct a ThetaVector from a flat tensor (used after aggregation).
-
-    The returned ThetaVector holds the aggregated weights as a non-leaf
-    parameter so gradients can still flow in subsequent local training.
     """
     p = _theta_size(k_edge, k_node)
     assert flat.shape == (p,), f"Expected flat tensor of size {p}, got {flat.shape}"
-    tv = ThetaVector(k_edge, k_node)
+    
+    # FIX: Move the newly instantiated module to the correct device
+    tv = ThetaVector(k_edge, k_node).to(flat.device)
+    
     with torch.no_grad():
         tv.theta.copy_(flat)
     return tv

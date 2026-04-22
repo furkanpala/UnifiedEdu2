@@ -37,62 +37,63 @@ def _load_model_and_tokenizer(model_name: str, device: str):
 def _generate_qa_pairs(
     model,
     tokenizer,
-    samples:    List[dict],
+    samples:     List[dict],
     theta_flat: torch.Tensor,
     k_edge:     int,
     k_node:     int,
     device:     str,
     max_new_tokens: int = 128,
 ) -> List[Dict[str, str]]:
-    """Generate (question, answer) pairs for each sample context."""
     from unifiededu.federation.client import assign_layer_groups, modulate_params
     from unifiededu.models.gnn_params import theta_from_flat
-    from torch.func import functional_call
 
+    # 1. Instantiate Theta and modulate params
     theta  = theta_from_flat(theta_flat.to(device), k_edge, k_node)
     groups = assign_layer_groups(model, k_edge, k_node)
     params = modulate_params(model, theta, groups)
 
+    # 2. Swap the modulated parameters into the model temporarily
+    orig_state = {k: v.clone() for k, v in model.state_dict().items() if k in params}
+    model.load_state_dict(params, strict=False)
+
     results = []
-    for s in samples:
-        prompt = f"Context: {s['context']}\n\nQuestion: "
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            max_length=400,
-            truncation=True,
-        ).to(device)
+    
+    try:
+        for s in samples:
+            prompt = f"Context: {s['context']}\n\nQuestion: "
+            inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                max_length=400,
+                truncation=True,
+            ).to(device)
 
-        with torch.no_grad():
-            out = functional_call(
-                model, params, args=(),
-                kwargs={**inputs, "max_new_tokens": max_new_tokens},
-                strict=False,
-            )
-            # Fallback: call model directly if functional_call doesn't support generate
-            if not hasattr(out, "sequences"):
+            with torch.no_grad():
+                # Now model.generate uses the Theta-modulated weights
                 gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+            generated = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+            
+            if "Answer:" in generated:
+                parts = generated.split("Answer:", 1)
+                q_part = parts[0].replace("Question:", "").strip()
+                a_part = parts[1].strip()
             else:
-                gen_ids = out.sequences
+                q_part = generated.strip()
+                a_part = ""
 
-        generated = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        # Split at "Answer:" if present
-        if "Answer:" in generated:
-            parts = generated.split("Answer:", 1)
-            q_part = parts[0].replace("Question:", "").strip()
-            a_part = parts[1].strip()
-        else:
-            q_part = generated.strip()
-            a_part = ""
+            results.append({
+                "sample_id": s["sample_id"],
+                "context":   s["context"],
+                "question":  q_part,
+                "answer":    a_part,
+                "ref_question": s["question"],
+                "ref_answer":   s["answer"],
+            })
+    finally:
+        # 3. Restore the original frozen weights so we don't leak state
+        model.load_state_dict(orig_state, strict=False)
 
-        results.append({
-            "sample_id": s["sample_id"],
-            "context":   s["context"],
-            "question":  q_part,
-            "answer":    a_part,
-            "ref_question": s["question"],
-            "ref_answer":   s["answer"],
-        })
     return results
 
 
@@ -221,6 +222,31 @@ def main():
         agg = run_evaluation(generated, out_path, device=args.device)
         all_agg[client_name] = agg
         log.info("%s: %s", client_name, agg)
+        
+    # --- Global test set evaluation ---
+    if "global" in splits:
+        log.info("Evaluating on global test set...")
+        global_samples = splits["global"]["test"]
+
+        # Use the grand-mean Theta (last inter-cluster average)
+        # which is the most general parameter vector
+        grand_theta = torch.stack(list(thetas.values())).mean(dim=0)
+
+        generated_global = _generate_qa_pairs(
+            model, tokenizer, global_samples, grand_theta,
+            cfg.model_graph.k_edge, cfg.model_graph.k_node,
+            args.device,
+        )
+
+        global_out_path = os.path.join(
+            args.output_dir,
+            f"global_test_{args.method}.json",
+        )
+        global_agg = run_evaluation(
+            generated_global, global_out_path, device=args.device
+        )
+        all_agg["global"] = global_agg
+        log.info("Global test: %s", global_agg)
 
     # Save summary
     summary_path = os.path.join(args.output_dir, "summary.json")

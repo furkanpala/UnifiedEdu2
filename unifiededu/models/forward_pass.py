@@ -100,6 +100,12 @@ def dag_forward(
             act_fn   = _ACT_FN.get(act_code, lambda x: x)
             H[v]     = act_fn(pre_act + bias_v)
 
+        # LayerNorm affine: H = H * gamma + beta (only when gamma stored)
+        gamma_v = node_feats[v, 2].item()
+        if gamma_v != 0.0:
+            beta_v = node_feats[v, 3].item()
+            H[v]   = H[v] * gamma_v + beta_v
+
     output_ids = graph.output_node_ids
     return H[output_ids]  # (N_out, feature_dim)
 
@@ -163,8 +169,10 @@ def dag_forward_batched(
         H.scatter_add_(1, tgt_expand, msgs)
 
         # Add bias + activation for each node in this layer
-        biases   = node_feats[layer_node_ids, 0]         # (n_l,)
-        act_codes = node_feats[layer_node_ids, 1].long() # (n_l,)
+        biases    = node_feats[layer_node_ids, 0]         # (n_l,)
+        act_codes = node_feats[layer_node_ids, 1].long()  # (n_l,)
+        gammas    = node_feats[layer_node_ids, 2]         # (n_l,)
+        betas     = node_feats[layer_node_ids, 3]         # (n_l,)
 
         H[:, layer_node_ids, :] = H[:, layer_node_ids, :] + biases.unsqueeze(0).unsqueeze(-1)
 
@@ -172,6 +180,14 @@ def dag_forward_batched(
         for i, nid in enumerate(layer_node_ids.tolist()):
             act_fn = _ACT_FN.get(int(act_codes[i].item()), lambda x: x)
             H[:, nid, :] = act_fn(H[:, nid, :])
+
+        # LayerNorm affine: H = H * gamma + beta (only at nodes where gamma != 0)
+        ln_mask = gammas.abs() > 0
+        if ln_mask.any():
+            ln_ids = layer_node_ids[ln_mask]
+            g = gammas[ln_mask].to(device).unsqueeze(0).unsqueeze(-1)  # (1, n_ln, 1)
+            b = betas[ln_mask].to(device).unsqueeze(0).unsqueeze(-1)
+            H[:, ln_ids, :] = H[:, ln_ids, :] * g + b
 
     output_ids = graph.output_node_ids
     return H[:, output_ids, :]  # (B, N_out, feature_dim)

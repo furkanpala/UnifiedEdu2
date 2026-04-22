@@ -15,9 +15,9 @@ python train.py --method unifiededu \\
 
 # Per-client backbones (heterogeneous federation):
 python train.py --method unifiededu \\
-    --mit-model      bert-base-uncased \\
-    --stanford-model bert-base-uncased \\
-    --papers-model   gpt2 \\
+    --mit-model      distilgpt2 \\
+    --stanford-model facebook/opt-125m \\
+    --papers-model   EleutherAI/pythia-160m \\
     --data-dir data/processed \\
     --output-dir runs/hetero
 
@@ -383,8 +383,8 @@ def main():
         # Resolve per-client model names
         per_client = {
             "mit":      args.mit_model      or args.model or "distilgpt2",
-            "stanford": args.stanford_model or args.model or "distilgpt2",
-            "papers":   args.papers_model   or args.model or "distilgpt2",
+            "stanford": args.stanford_model or args.model or "facebook/opt-125m",
+            "papers":   args.papers_model   or args.model or "EleutherAI/pythia-160m",
         }
         models_and_toks = [
             _load_hf_model(per_client[name], args.device)

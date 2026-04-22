@@ -30,6 +30,15 @@ from ..config import FederationConfig, TrainingConfig
 # Layer-group assignment
 # ---------------------------------------------------------------------------
 
+
+def _is_linear_or_conv1d(module: nn.Module) -> bool:
+    if isinstance(module, nn.Linear):
+        return True
+    # Catch Hugging Face's custom GPT-2 Conv1D
+    if module.__class__.__name__ == "Conv1D":
+        return True
+    return False
+
 def assign_layer_groups(
     model:  nn.Module,
     k_edge: int,
@@ -49,7 +58,7 @@ def assign_layer_groups(
     groups: Dict[str, Tuple[int, int]] = {}
     i = 0
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
+        if _is_linear_or_conv1d(module):
             groups[name] = (i % k_edge, i % k_node)
             i += 1
     return groups
@@ -85,7 +94,7 @@ def modulate_params(
     params: Dict[str, torch.Tensor] = {}
 
     for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
+        if not _is_linear_or_conv1d(module):
             continue
         group_info = layer_groups.get(name)
         if group_info is None:

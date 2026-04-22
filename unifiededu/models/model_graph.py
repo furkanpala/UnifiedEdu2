@@ -346,23 +346,35 @@ def _convert_attention_block(
         if hasattr(attn_module, attr):
             o_proj = getattr(attn_module, attr); break
 
-    # Fused QKV (e.g. DistilBERT c_attn, GPT-2)
-    for attr in ("c_attn", "qkv"):
+    # Fused QKV (GPT-2: c_attn; Pythia/GPT-NeoX: query_key_value; DistilBERT: qkv)
+    for attr in ("c_attn", "query_key_value", "qkv"):
         if hasattr(attn_module, attr):
             fused_qkv = getattr(attn_module, attr); break
 
-    # --- Case A: fused QKV weight (3*H, H) --------------------------------
+    # --- Case A: fused QKV weight ----------------------------------------
+    # nn.Linear weight shape: (3*H, H)  -- chunk dim=0
+    # Conv1D  weight shape: (H, 3*H)   -- chunk dim=1, then .t() each chunk
     if fused_qkv is not None and q_proj is None:
-        total_out = fused_qkv.weight.shape[0]
-        chunk = total_out // 3
-        q_weight = fused_qkv.weight[:chunk]
-        k_weight = fused_qkv.weight[chunk:2*chunk]
-        v_weight = fused_qkv.weight[2*chunk:]
-        q_bias = fused_qkv.bias[:chunk]    if fused_qkv.bias is not None else None
-        k_bias = fused_qkv.bias[chunk:2*chunk] if fused_qkv.bias is not None else None
-        v_bias = fused_qkv.bias[2*chunk:]  if fused_qkv.bias is not None else None
+        is_conv1d = fused_qkv.__class__.__name__ == "Conv1D"
+        if is_conv1d:
+            # weight: (in_features, 3*hidden) -> chunk along dim=1
+            total_out = fused_qkv.weight.shape[1]
+            chunk = total_out // 3
+            q_weight = fused_qkv.weight[:, :chunk].t().contiguous()
+            k_weight = fused_qkv.weight[:, chunk:2*chunk].t().contiguous()
+            v_weight = fused_qkv.weight[:, 2*chunk:].t().contiguous()
+        else:
+            # weight: (3*hidden, in_features) -> chunk along dim=0
+            total_out = fused_qkv.weight.shape[0]
+            chunk = total_out // 3
+            q_weight = fused_qkv.weight[:chunk]
+            k_weight = fused_qkv.weight[chunk:2*chunk]
+            v_weight = fused_qkv.weight[2*chunk:]
 
-        # Wrap slices as temporary objects
+        q_bias = fused_qkv.bias[:chunk]        if fused_qkv.bias is not None else None
+        k_bias = fused_qkv.bias[chunk:2*chunk] if fused_qkv.bias is not None else None
+        v_bias = fused_qkv.bias[2*chunk:]      if fused_qkv.bias is not None else None
+
         class _FakeLinear:
             def __init__(self, w, b):
                 self.weight = w
@@ -409,10 +421,10 @@ def _convert_attention_block(
     # attended representation as V projected through O (simplification
     # that preserves all learnable parameters).
     if o_proj is not None:
-        # The output projection maps from the concatenated heads back to hidden_size.
-        # We use V as the approximation of the post-softmax attended values.
+        # Output projection maps concatenated heads back to hidden_size.
+        # Conv1D weight needs transposing to (out, in) orientation.
         attn_out_ids = builder.add_dense_layer(
-            weight=o_proj.weight, bias=o_proj.bias,
+            weight=_get_linear_weight(o_proj), bias=o_proj.bias,
             src_node_ids=v_ids,
             activation=ActivationType.LINEAR,
             layer_id=layer_offset + 1,
@@ -489,6 +501,7 @@ def _convert_bert(model: nn.Module, cfg) -> Tuple[_GraphBuilder, str]:
         eg_base = 1 + block_idx * 6
 
         # Self-attention
+        pre_attn_ids = current_ids
         attn_ids = _convert_attention_block(
             builder=builder,
             attn_module=attn,
@@ -506,10 +519,15 @@ def _convert_bert(model: nn.Module, cfg) -> Tuple[_GraphBuilder, str]:
         if ln1 is not None and hasattr(ln1, 'weight'):
             _absorb_layer_norm(builder, attn_ids, ln1)
 
+        # Residual skip: x + Attention(x)
+        if attn_ids is not pre_attn_ids and len(attn_ids) == len(pre_attn_ids):
+            _add_residual_edges(builder, pre_attn_ids, attn_ids, eg_base)
+
         current_ids = attn_ids
 
         # FFN
         if ffn_intermediate is not None and ffn_output is not None:
+            pre_ffn_ids = current_ids
             act_type = _infer_bert_ffn_activation(layer)
             ffn_ids = builder.add_dense_layer(
                 weight=ffn_intermediate.weight, bias=ffn_intermediate.bias,
@@ -533,6 +551,10 @@ def _convert_bert(model: nn.Module, cfg) -> Tuple[_GraphBuilder, str]:
 
             if ln2 is not None and hasattr(ln2, 'weight'):
                 _absorb_layer_norm(builder, ffn_out_ids, ln2)
+
+            # Residual skip: x + FFN(x)
+            if len(ffn_out_ids) == len(pre_ffn_ids):
+                _add_residual_edges(builder, pre_ffn_ids, ffn_out_ids, eg_base + 5)
 
             current_ids = ffn_out_ids
 
@@ -583,6 +605,7 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
         # Self-attention (LLaMA uses self_attn)
         attn = _find_submodule_attr(layer, ("self_attn", "attention"))
         if attn is not None:
+            pre_attn_ids = current_ids
             attn_ids = _convert_attention_block(
                 builder=builder,
                 attn_module=attn,
@@ -601,14 +624,23 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
             if rms1 is not None and hasattr(rms1, 'weight'):
                 _absorb_rms_norm(builder, attn_ids, rms1)
 
+            # Residual skip: x + Attention(x)
+            if attn_ids is not pre_attn_ids and len(attn_ids) == len(pre_attn_ids):
+                _add_residual_edges(builder, pre_attn_ids, attn_ids, eg_base)
+
             current_ids = attn_ids
 
-        # Gated FFN (LLaMA uses SwiGLU: gate_proj, up_proj, down_proj)
+        # Gated FFN (LLaMA/Qwen use SwiGLU: gate_proj * up_proj -> down_proj)
+        # NOTE: SwiGLU is multiplicative (gate * up), but the DAG is strictly
+        # additive.  We approximate by adding cross-edges from up_ids into
+        # down_ids.  This DAG is a structural proxy for grouping Theta weights,
+        # NOT a mathematically exact forward-pass emulator.
         gate_proj = _find_submodule_attr(layer, ("mlp.gate_proj",))
         up_proj   = _find_submodule_attr(layer, ("mlp.up_proj",))
         down_proj = _find_submodule_attr(layer, ("mlp.down_proj",))
 
         if gate_proj is not None and up_proj is not None and down_proj is not None:
+            pre_ffn_ids = current_ids
             # Gate branch (SiLU activation)
             gate_ids = builder.add_dense_layer(
                 weight=gate_proj.weight, bias=gate_proj.bias,
@@ -629,9 +661,6 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
             )
             layer_id += 1
 
-            # Element-wise product of gate and up is approximated as:
-            # down_proj receives gate_ids (the gated representation).
-            # We encode the up_proj output as additional edges into down_proj nodes.
             down_ids = builder.add_dense_layer(
                 weight=down_proj.weight, bias=down_proj.bias,
                 src_node_ids=gate_ids,
@@ -640,7 +669,7 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
                 node_group_id=ng_base + 6,
                 edge_group_id=eg_base + 6,
             )
-            # Also connect up_ids -> down_ids (captures SwiGLU multiplicative path)
+            # Additive proxy for the multiplicative SwiGLU path
             _add_cross_edges(builder, up_ids, down_ids, eg_base + 5)
             layer_id += 1
 
@@ -648,26 +677,32 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
             if rms2 is not None and hasattr(rms2, 'weight'):
                 _absorb_rms_norm(builder, down_ids, rms2)
 
+            # Residual skip: x + FFN(x)
+            if len(down_ids) == len(pre_ffn_ids):
+                _add_residual_edges(builder, pre_ffn_ids, down_ids, eg_base + 6)
+
             current_ids = down_ids
 
         else:
-            # Fallback: standard two-layer FFN
+            # Fallback: standard two-layer FFN (GPT-2 / OPT / Pythia)
+            # _get_linear_weight handles Conv1D (in,out) -> transpose to (out,in)
             mlp = _find_submodule_attr(layer, ("mlp", "feed_forward"))
             if mlp is not None:
                 fc1 = _find_submodule_attr(mlp, ("fc1", "w1", "dense_h_to_4h", "c_fc"))
                 fc2 = _find_submodule_attr(mlp, ("fc2", "w2", "dense_4h_to_h", "c_proj"))
                 if fc1 is not None and fc2 is not None:
+                    pre_ffn_ids = current_ids
                     ffn_ids = builder.add_dense_layer(
-                        weight=fc1.weight, bias=fc1.bias,
+                        weight=_get_linear_weight(fc1), bias=fc1.bias,
                         src_node_ids=current_ids,
-                        activation=ActivationType.SILU,
+                        activation=ActivationType.GELU,
                         layer_id=layer_id,
                         node_group_id=ng_base + 4,
                         edge_group_id=eg_base + 4,
                     )
                     layer_id += 1
                     out_ids = builder.add_dense_layer(
-                        weight=fc2.weight, bias=fc2.bias,
+                        weight=_get_linear_weight(fc2), bias=fc2.bias,
                         src_node_ids=ffn_ids,
                         activation=ActivationType.LINEAR,
                         layer_id=layer_id,
@@ -675,6 +710,11 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
                         edge_group_id=eg_base + 5,
                     )
                     layer_id += 1
+
+                    # Residual skip: x + FFN(x)
+                    if len(out_ids) == len(pre_ffn_ids):
+                        _add_residual_edges(builder, pre_ffn_ids, out_ids, eg_base + 5)
+
                     current_ids = out_ids
 
     # LM head
@@ -826,6 +866,34 @@ def _add_cross_edges(
     for src in src_ids:
         for tgt in tgt_ids:
             builder.add_edge(src=src, tgt=tgt, weight=1.0, group_id=edge_group_id)
+
+
+def _add_residual_edges(
+    builder: _GraphBuilder,
+    src_ids: List[int],
+    tgt_ids: List[int],
+    edge_group_id: int,
+) -> None:
+    """
+    Add identity (weight=1.0) skip-connection edges: src[i] -> tgt[i].
+
+    Only wires pairs with the same index so the DAG stays sparse (N edges,
+    not N^2).  Silently skips extra elements if lengths differ.
+    """
+    for src, tgt in zip(src_ids, tgt_ids):
+        builder.add_edge(src=src, tgt=tgt, weight=1.0, group_id=edge_group_id)
+
+
+def _get_linear_weight(module: nn.Module) -> torch.Tensor:
+    """
+    Return the weight tensor oriented as (out_features, in_features).
+
+    nn.Linear stores weight as (out, in).
+    HuggingFace Conv1D stores weight as (in, out) -- transpose required.
+    """
+    if module.__class__.__name__ == "Conv1D":
+        return module.weight.t()
+    return module.weight
 
 
 def _find_submodule(model: nn.Module, attr_paths: Tuple[str, ...]) -> Optional[nn.Module]:

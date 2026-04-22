@@ -93,12 +93,12 @@ def compute_bloom_level_llm(
     List of (level: int, reason: str) tuples.
     """
     try:
-        import openai
-        if api_key:
-            openai.api_key = api_key
+        from openai import OpenAI
     except ImportError:
         log.warning("openai package not found; returning level=1 for all questions.")
         return [(1, "openai not available")] * len(questions)
+
+    client = OpenAI(api_key=api_key)
 
     bloom_desc = "\n".join(
         f"  {k}: {v}" for k, v in BLOOM_LEVELS.items()
@@ -114,7 +114,7 @@ def compute_bloom_level_llm(
             f'{{ "level": <int 1-6>, "reason": "<brief justification>" }}'
         )
         try:
-            response = openai.ChatCompletion.create(
+            response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
