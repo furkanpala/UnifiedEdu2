@@ -22,8 +22,6 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 from torch.optim import AdamW
-from tqdm.auto import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 log = logging.getLogger(__name__)
 
@@ -219,45 +217,31 @@ class FederationClient:
         theta.train()
         optimizer.zero_grad()
 
-        # redirect_tqdm ensures log messages don't break the progress bar formatting
-        # with logging_redirect_tqdm(tqdm_class=tqdm):
         for epoch in range(local_eps):
             pending    = 0
             epoch_loss = 0.0
             n_batches  = 0
-            ep_label   = f"C{self.client_id}({self.model_name}) Ep {epoch+1}/{local_eps}"
-            
-            # Using 'with' ensures pbar.close() is called before we log at the end of the epoch
-            with tqdm(
-                self.dataloader, 
-                desc=ep_label, 
-                leave=False, 
-                unit="batch", 
-                dynamic_ncols=True
-            ) as pbar:
-                
-                for batch in pbar:
-                    loss = self._compute_loss(batch, theta)
-                    (loss / accum).backward()
-                    
-                    pending    += 1
-                    current_val = loss.item()
-                    epoch_loss += current_val
-                    n_batches  += 1
 
-                    if pending == accum:
-                        torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        pending = 0
+            for batch in self.dataloader:
+                loss = self._compute_loss(batch, theta)
+                (loss / accum).backward()
 
-                # Flush remaining gradients at end of epoch
-                if pending > 0:
+                pending    += 1
+                epoch_loss += loss.item()
+                n_batches  += 1
+
+                if pending == accum:
                     torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
+                    pending = 0
 
-            # The pbar is now closed. Logging is safe and won't cause line-breaks.
+            # Flush remaining gradients at end of epoch
+            if pending > 0:
+                torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
             avg = epoch_loss / max(n_batches, 1)
             log.info(
                 "C%d(%s) ep%d/%d  avg_loss=%.4f",
