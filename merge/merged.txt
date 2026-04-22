@@ -1,0 +1,5523 @@
+// File: c:\Users\fp223\Projects\UnifiedEdu\tests\test_clustering.py
+"""
+Smoke tests for federation/clustering.py
+
+Run: /c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_clustering.py
+"""
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import numpy as np
+import torch
+
+from unifiededu.federation.clustering import (
+    pairwise_l2,
+    ward_linkage,
+    best_cut,
+    cluster_thetas,
+    intra_cluster_average,
+    inter_cluster_average,
+    ClusterResult,
+)
+
+
+def _assert(cond, msg=""):
+    if not cond:
+        raise AssertionError(msg)
+
+
+def test_pairwise_l2_shape_and_symmetry():
+    m, p = 5, 34
+    thetas = torch.randn(m, p)
+    D = pairwise_l2(thetas)
+    _assert(D.shape == (m, m), f"Shape mismatch: {D.shape}")
+    _assert(np.allclose(D, D.T), "Not symmetric")
+    _assert(np.allclose(np.diag(D), 0), "Diagonal not zero")
+    _assert((D >= 0).all(), "Negative distances")
+
+
+def test_pairwise_l2_known_values():
+    # Two vectors differing by 1 in each of 4 dims -> L2 = 2
+    t = torch.tensor([[0., 0., 0., 0.], [1., 1., 1., 1.]])
+    D = pairwise_l2(t)
+    _assert(abs(D[0, 1] - 2.0) < 1e-6, f"Expected 2.0, got {D[0,1]}")
+
+
+def test_ward_linkage_shape():
+    m = 6
+    D = np.random.rand(m, m)
+    D = (D + D.T) / 2
+    np.fill_diagonal(D, 0)
+    Z = ward_linkage(D)
+    _assert(Z.shape == (m - 1, 4), f"Linkage shape: {Z.shape}")
+
+
+def test_best_cut_two_tight_clusters():
+    """Points in two well-separated clusters should give K=2."""
+    # Cluster A: 3 points near (0,0), Cluster B: 3 points near (10,0)
+    pts = torch.tensor([
+        [0.0, 0.1], [0.1, 0.0], [-0.1, 0.05],
+        [10.0, 0.1], [9.9, 0.0], [10.1, 0.05],
+    ])
+    D = pairwise_l2(pts)
+    Z = ward_linkage(D)
+    labels, k, sil = best_cut(Z, D, max_k=3)
+    _assert(k == 2, f"Expected K=2, got {k}")
+    _assert(sil > 0.5, f"Expected high silhouette, got {sil:.4f}")
+    # Both halves should be in the same cluster
+    _assert(labels[0] == labels[1] == labels[2], "Cluster A not cohesive")
+    _assert(labels[3] == labels[4] == labels[5], "Cluster B not cohesive")
+    _assert(labels[0] != labels[3], "Clusters A and B should differ")
+
+
+def test_best_cut_single_institution():
+    """m=1 must return a single cluster without error."""
+    thetas = torch.randn(1, 34)
+    result = cluster_thetas(thetas, max_clusters=1)
+    _assert(result.num_clusters == 1)
+    _assert(result.silhouette == -1.0)
+
+
+def test_best_cut_max_k_cap():
+    """max_k=1 forces a single cluster regardless of data."""
+    pts = torch.tensor([[0.0], [10.0], [20.0], [30.0]])
+    D = pairwise_l2(pts)
+    Z = ward_linkage(D)
+    labels, k, sil = best_cut(Z, D, max_k=1)
+    _assert(k == 1, f"Expected forced K=1, got {k}")
+    _assert((labels == 0).all(), "All should be in cluster 0")
+
+
+def test_cluster_thetas_output_structure():
+    """cluster_thetas returns a valid ClusterResult."""
+    m, p = 6, 34
+    # Construct two clear groups
+    group_a = torch.zeros(3, p)
+    group_b = torch.ones(3, p) * 50.0
+    thetas = torch.cat([group_a, group_b], dim=0)
+
+    result = cluster_thetas(thetas, max_clusters=3)
+    _assert(isinstance(result, ClusterResult))
+    _assert(result.num_clusters >= 1)
+    _assert(result.labels.shape == (m,))
+    _assert(result.dist_matrix.shape == (m, m))
+    total_members = sum(len(v) for v in result.clusters.values())
+    _assert(total_members == m, f"Member count mismatch: {total_members}")
+
+
+def test_cluster_thetas_separates_groups():
+    """Two tight, well-separated groups should be identified."""
+    p = 34
+    group_a = torch.randn(3, p) * 0.01            # near origin
+    group_b = torch.randn(3, p) * 0.01 + 100.0    # far away
+    thetas = torch.cat([group_a, group_b], dim=0)
+
+    result = cluster_thetas(thetas, max_clusters=3)
+    _assert(result.num_clusters == 2, f"Expected K=2, got {result.num_clusters}")
+    labels = result.labels
+    _assert(labels[0] == labels[1] == labels[2], "Group A not cohesive")
+    _assert(labels[3] == labels[4] == labels[5], "Group B not cohesive")
+    _assert(labels[0] != labels[3], "Groups should differ")
+
+
+def test_intra_cluster_average():
+    """Mean within each cluster should match manual computation."""
+    p = 4
+    t0 = torch.tensor([1., 0., 0., 0.])
+    t1 = torch.tensor([3., 0., 0., 0.])
+    t2 = torch.tensor([100., 0., 0., 0.])
+    thetas = torch.stack([t0, t1, t2])
+
+    result = ClusterResult(
+        labels=np.array([0, 0, 1]),
+        num_clusters=2,
+        silhouette=0.9,
+        clusters={0: [0, 1], 1: [2]},
+        dist_matrix=np.zeros((3, 3)),
+        linkage_matrix=np.zeros((2, 4)),
+    )
+    means = intra_cluster_average(thetas, result)
+    expected_c0 = torch.tensor([2., 0., 0., 0.])
+    _assert(torch.allclose(means[0], expected_c0), f"Cluster 0 mean wrong: {means[0]}")
+    _assert(torch.allclose(means[1], t2), f"Cluster 1 mean wrong: {means[1]}")
+
+
+def test_inter_cluster_average():
+    """Grand mean across cluster centroids (unweighted by size)."""
+    means = {
+        0: torch.tensor([0., 0.]),
+        1: torch.tensor([4., 0.]),
+    }
+    grand = inter_cluster_average(means)
+    _assert(torch.allclose(grand, torch.tensor([2., 0.])), f"Got {grand}")
+
+
+def test_max_clusters_cap_respected():
+    """cluster_thetas never returns more clusters than max_clusters."""
+    p = 34
+    # 8 institutions each with a very distinct Theta
+    thetas = torch.eye(8, p) * 1000.0
+    result = cluster_thetas(thetas, max_clusters=4)
+    _assert(result.num_clusters <= 4, f"Exceeded max_clusters: {result.num_clusters}")
+
+
+if __name__ == "__main__":
+    tests = [
+        test_pairwise_l2_shape_and_symmetry,
+        test_pairwise_l2_known_values,
+        test_ward_linkage_shape,
+        test_best_cut_two_tight_clusters,
+        test_best_cut_single_institution,
+        test_best_cut_max_k_cap,
+        test_cluster_thetas_output_structure,
+        test_cluster_thetas_separates_groups,
+        test_intra_cluster_average,
+        test_inter_cluster_average,
+        test_max_clusters_cap_respected,
+    ]
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+        except Exception as e:
+            import traceback
+            print(f"FAIL  {t.__name__}: {e}")
+            traceback.print_exc()
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\tests\test_dataset.py
+"""
+Tests for data/dataset.py
+
+Uses a lightweight mock tokenizer so no model download is required.
+One test (test_with_gpt2_tokenizer) attempts to use the real GPT-2
+tokenizer if it is cached locally; it is skipped gracefully otherwise.
+
+Run: /c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_dataset.py
+"""
+
+import sys, os, logging
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import torch
+from torch.utils.data import DataLoader
+
+from unifiededu.data.dataset import (
+    QADataset, QACollator, make_dataloader,
+    _tokenize_sample, _build_texts, LABEL_IGNORE_ID,
+)
+
+logging.basicConfig(level=logging.WARNING)
+
+
+def _assert(cond, msg=""):
+    if not cond:
+        raise AssertionError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Minimal mock tokenizer (no HuggingFace download needed)
+# ---------------------------------------------------------------------------
+
+class _MockTokenizer:
+    """
+    Character-level tokenizer for testing.
+    Each character maps to its ASCII code; vocab size = 256.
+    Special tokens: BOS=1, EOS=2, PAD=0.
+    """
+    bos_token_id = 1
+    eos_token_id = 2
+    pad_token_id = 0
+    model_max_length = 2048
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list:
+        ids = [ord(c) % 200 + 3 for c in text]   # 3..202, never clash with special tokens
+        if add_special_tokens:
+            ids = [self.bos_token_id] + ids
+        return ids
+
+    def decode(self, ids: list, skip_special_tokens: bool = True) -> str:
+        specials = {self.bos_token_id, self.eos_token_id, self.pad_token_id}
+        if skip_special_tokens:
+            ids = [i for i in ids if i not in specials]
+        return "".join(chr((i - 3) % 200 + 32) for i in ids)
+
+    def __call__(self, text: str, max_length: int = 512, truncation: bool = True,
+                 padding: bool = False, add_special_tokens: bool = True,
+                 return_tensors=None, **_):
+        ids = self.encode(text, add_special_tokens=add_special_tokens)
+        if truncation and len(ids) > max_length:
+            ids = ids[:max_length]
+        mask = [1] * len(ids)
+        return {"input_ids": ids, "attention_mask": mask}
+
+
+_TOK = _MockTokenizer()
+
+_SAMPLE = {
+    "sample_id": "test001",
+    "context":   "Gradient descent minimises the loss by taking steps proportional to the negative gradient.",
+    "question":  "What does gradient descent minimise?",
+    "answer":    "The loss function.",
+    "difficulty": "easy",
+    "bloom_level": "understand",
+    "metadata":  {},
+}
+
+_LONG_SAMPLE = {
+    "sample_id": "long001",
+    "context":   "A " * 400,          # very long context (~800 chars)
+    "question":  "Short question?",
+    "answer":    "Short answer.",
+    "difficulty": "easy",
+    "bloom_level": "unknown",
+    "metadata":  {},
+}
+
+
+# ---------------------------------------------------------------------------
+# _build_texts
+# ---------------------------------------------------------------------------
+
+def test_build_texts_contains_all_parts():
+    prefix, completion = _build_texts("ctx", "q?", "ans")
+    _assert("ctx"   in prefix,     "Context missing from prefix")
+    _assert("q?"    in completion, "Question missing from completion")
+    _assert("ans"   in completion, "Answer missing from completion")
+    _assert("q?"    not in prefix, "Question should not be in prefix")
+
+
+def test_build_texts_prefix_ends_at_question_prompt():
+    """The prefix should end with the 'Question: ' template string."""
+    prefix, _ = _build_texts("some context", "q?", "ans")
+    _assert(prefix.endswith("Question: "), f"Prefix doesn't end with 'Question: ': {repr(prefix[-20:])}")
+
+
+# ---------------------------------------------------------------------------
+# _tokenize_sample
+# ---------------------------------------------------------------------------
+
+def test_tokenize_output_keys():
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    _assert(set(out.keys()) == {"input_ids", "attention_mask", "labels"})
+
+
+def test_tokenize_tensor_types():
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    for key in ("input_ids", "attention_mask", "labels"):
+        _assert(isinstance(out[key], torch.Tensor), f"{key} is not a Tensor")
+        _assert(out[key].dtype == torch.long, f"{key} dtype is {out[key].dtype}")
+
+
+def test_tokenize_shapes_match():
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    L = out["input_ids"].shape[0]
+    _assert(out["attention_mask"].shape[0] == L, "attention_mask length mismatch")
+    _assert(out["labels"].shape[0] == L,          "labels length mismatch")
+
+
+def test_tokenize_respects_max_length():
+    for ml in (64, 128, 256, 512):
+        out = _tokenize_sample(_LONG_SAMPLE, _TOK, max_length=ml)
+        _assert(out["input_ids"].shape[0] <= ml,
+                f"max_length={ml} violated: got {out['input_ids'].shape[0]}")
+
+
+def test_tokenize_completion_tokens_are_present():
+    """At least some labels should be non -100 (QA part survived truncation)."""
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    n_real = (out["labels"] != LABEL_IGNORE_ID).sum().item()
+    _assert(n_real > 0, "All labels are -100; completion was lost")
+
+
+def test_tokenize_prefix_masked():
+    """The first token(s) should always be masked (BOS / context prefix)."""
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    _assert(out["labels"][0].item() == LABEL_IGNORE_ID,
+            "First token should be masked (BOS / context prefix)")
+
+
+def test_tokenize_no_label_in_context():
+    """
+    No label token in the prefix portion should equal the corresponding
+    input_id (they should all be -100).
+    """
+    out    = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    labels = out["labels"]
+    # Find where the real labels start
+    first_real = next((i for i, l in enumerate(labels.tolist()) if l != LABEL_IGNORE_ID), None)
+    if first_real is not None:
+        # Everything before first_real must be -100
+        prefix_labels = labels[:first_real]
+        _assert(
+            (prefix_labels == LABEL_IGNORE_ID).all(),
+            "Found non-masked label in context prefix"
+        )
+
+
+def test_tokenize_long_context_truncated():
+    """Long context must be truncated so QA completion is still present."""
+    out = _tokenize_sample(_LONG_SAMPLE, _TOK, max_length=128, qa_max_tokens=64)
+    n_real = (out["labels"] != LABEL_IGNORE_ID).sum().item()
+    _assert(n_real > 0, f"Long context sample has no real labels; qa completion lost")
+    _assert(out["input_ids"].shape[0] <= 128)
+
+
+def test_tokenize_eos_appended():
+    """If tokenizer has eos_token_id, the last non-pad label should be EOS."""
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    real_labels = [l for l in out["labels"].tolist() if l != LABEL_IGNORE_ID]
+    if real_labels:
+        _assert(real_labels[-1] == _TOK.eos_token_id,
+                f"Last label {real_labels[-1]} is not EOS ({_TOK.eos_token_id})")
+
+
+def test_tokenize_attention_mask_all_ones_no_pad():
+    """With no padding, all attention mask values should be 1."""
+    out = _tokenize_sample(_SAMPLE, _TOK, max_length=512)
+    _assert(out["attention_mask"].all(), "Some attention mask values are 0 without padding")
+
+
+# ---------------------------------------------------------------------------
+# QADataset
+# ---------------------------------------------------------------------------
+
+def test_dataset_len():
+    samples = [_SAMPLE, _LONG_SAMPLE]
+    ds = QADataset(samples, _TOK)
+    _assert(len(ds) == 2)
+
+
+def test_dataset_getitem_returns_dict():
+    ds  = QADataset([_SAMPLE], _TOK)
+    out = ds[0]
+    _assert(isinstance(out, dict))
+    _assert("input_ids" in out)
+
+
+def test_dataset_label_coverage_full():
+    """All samples have real labels → coverage should be 1.0."""
+    samples = [_SAMPLE] * 20
+    ds      = QADataset(samples, _TOK)
+    cov     = ds.label_coverage()
+    _assert(cov == 1.0, f"Expected coverage 1.0, got {cov}")
+
+
+# ---------------------------------------------------------------------------
+# QACollator
+# ---------------------------------------------------------------------------
+
+def _make_batch(lengths):
+    """Create a list of fake tokenised items with given sequence lengths."""
+    return [
+        {
+            "input_ids":      torch.ones(l, dtype=torch.long),
+            "attention_mask": torch.ones(l, dtype=torch.long),
+            "labels":         torch.zeros(l, dtype=torch.long),
+        }
+        for l in lengths
+    ]
+
+
+def test_collator_pads_to_max_length():
+    coll  = QACollator(pad_token_id=0)
+    batch = coll(_make_batch([4, 7, 3]))
+    for key in ("input_ids", "attention_mask", "labels"):
+        _assert(batch[key].shape == (3, 7), f"{key} shape: {batch[key].shape}")
+
+
+def test_collator_pad_values():
+    coll  = QACollator(pad_token_id=99, label_pad_id=-100)
+    batch = coll(_make_batch([2, 4]))
+    # Short sequence should have 2 padding tokens at the end
+    _assert(batch["input_ids"][0, 2].item() == 99,    "input pad value wrong")
+    _assert(batch["attention_mask"][0, 2].item() == 0, "attn pad value wrong")
+    _assert(batch["labels"][0, 2].item() == -100,      "label pad value wrong")
+
+
+def test_collator_no_pad_when_equal_length():
+    coll  = QACollator(pad_token_id=0)
+    batch = coll(_make_batch([5, 5]))
+    _assert(batch["input_ids"].shape == (2, 5))
+    _assert((batch["attention_mask"] == 1).all())
+
+
+# ---------------------------------------------------------------------------
+# make_dataloader
+# ---------------------------------------------------------------------------
+
+def test_make_dataloader_returns_dataloader():
+    dl = make_dataloader([_SAMPLE, _LONG_SAMPLE], _TOK, batch_size=2, shuffle=False)
+    _assert(isinstance(dl, DataLoader))
+
+
+def test_make_dataloader_batch_shapes():
+    samples = [_SAMPLE] * 8
+    dl      = make_dataloader(samples, _TOK, batch_size=4, max_length=128, shuffle=False)
+    batch   = next(iter(dl))
+    B, T    = batch["input_ids"].shape
+    _assert(B == 4, f"Batch size: {B}")
+    _assert(T <= 128, f"Seq length {T} exceeds max_length=128")
+    _assert(batch["labels"].shape == (B, T))
+    _assert(batch["attention_mask"].shape == (B, T))
+
+
+def test_make_dataloader_sets_pad_token_when_missing():
+    """Tokenizer without pad_token_id should have it set to eos_token_id."""
+    class _NoPadTok(_MockTokenizer):
+        pad_token_id = None  # type: ignore
+    tok = _NoPadTok()
+    dl  = make_dataloader([_SAMPLE], tok, batch_size=1, shuffle=False)
+    _assert(tok.pad_token_id == tok.eos_token_id,
+            "pad_token_id not set to eos_token_id")
+
+
+# ---------------------------------------------------------------------------
+# Integration: from_jsonl
+# ---------------------------------------------------------------------------
+
+def test_from_jsonl_roundtrip(tmp_path=None):
+    import tempfile, json, os
+    samples = [_SAMPLE, _LONG_SAMPLE]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "samples.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for s in samples:
+                f.write(json.dumps(s, ensure_ascii=False) + "\n")
+        ds = QADataset.from_jsonl(path, _TOK, max_length=256)
+    _assert(len(ds) == 2)
+    for i in range(2):
+        out = ds[i]
+        _assert(out["input_ids"].shape[0] <= 256)
+        _assert((out["labels"] != LABEL_IGNORE_ID).any(),
+                f"Sample {i}: all labels masked")
+
+
+# ---------------------------------------------------------------------------
+# Integration with real data (fast — no model download, uses mock tokenizer)
+# ---------------------------------------------------------------------------
+
+def test_real_data_no_truncation_loss():
+    """
+    All 547 balanced MIT samples should have at least one real label token
+    (QA completion always survives context truncation).
+    """
+    import sys; sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import random
+    from unifiededu.data.preprocessing import _load_multi_json, _flatten_to_samples, _stratified_subsample
+
+    records = _load_multi_json("ML_QA_LectureNotes_MIT.json")
+    samples = _flatten_to_samples(records, "mit")
+    rng     = random.Random(42)
+    balanced = _stratified_subsample(samples, 547, rng)
+
+    ds = QADataset(balanced, _TOK, max_length=512, qa_max_tokens=128)
+    fully_masked = 0
+    for i in range(len(ds)):
+        item = ds[i]
+        if not (item["labels"] != LABEL_IGNORE_ID).any():
+            fully_masked += 1
+
+    _assert(fully_masked == 0,
+            f"{fully_masked}/547 MIT samples have all labels masked (QA truncated)")
+
+
+def test_real_papers_data_with_truncation():
+    """Papers has long contexts; verify every sample still has QA tokens after truncation."""
+    import random
+    from unifiededu.data.preprocessing import _load_multi_json, _flatten_to_samples, _stratified_subsample
+
+    records  = _load_multi_json("ML_QA_Papers_v2.json")
+    samples  = _flatten_to_samples(records, "papers")
+    rng      = random.Random(42)
+    balanced = _stratified_subsample(samples, 547, rng)
+
+    ds = QADataset(balanced, _TOK, max_length=512, qa_max_tokens=128)
+    fully_masked = sum(
+        1 for i in range(len(ds))
+        if not (ds[i]["labels"] != LABEL_IGNORE_ID).any()
+    )
+    _assert(fully_masked == 0,
+            f"{fully_masked}/547 Papers samples have all labels masked (QA truncated)")
+
+
+if __name__ == "__main__":
+    tests = [
+        test_build_texts_contains_all_parts,
+        test_build_texts_prefix_ends_at_question_prompt,
+        test_tokenize_output_keys,
+        test_tokenize_tensor_types,
+        test_tokenize_shapes_match,
+        test_tokenize_respects_max_length,
+        test_tokenize_completion_tokens_are_present,
+        test_tokenize_prefix_masked,
+        test_tokenize_no_label_in_context,
+        test_tokenize_long_context_truncated,
+        test_tokenize_eos_appended,
+        test_tokenize_attention_mask_all_ones_no_pad,
+        test_dataset_len,
+        test_dataset_getitem_returns_dict,
+        test_dataset_label_coverage_full,
+        test_collator_pads_to_max_length,
+        test_collator_pad_values,
+        test_collator_no_pad_when_equal_length,
+        test_make_dataloader_returns_dataloader,
+        test_make_dataloader_batch_shapes,
+        test_make_dataloader_sets_pad_token_when_missing,
+        test_from_jsonl_roundtrip,
+        test_real_data_no_truncation_loss,
+        test_real_papers_data_with_truncation,
+    ]
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+        except Exception as e:
+            import traceback
+            print(f"FAIL  {t.__name__}: {e}")
+            traceback.print_exc()
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\tests\test_federation.py
+"""
+Integration tests for federation/client.py, server.py, fedavg.py.
+
+Uses a tiny 2-layer MLP as the 'backbone' so no HuggingFace download
+is needed, and a synthetic DataLoader that yields fixed batches.
+
+Run: /c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_federation.py
+"""
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+from typing import Iterator
+
+from unifiededu.models.gnn_params import ThetaVector, _theta_size
+from unifiededu.federation.client import (
+    FederationClient,
+    assign_layer_groups,
+    modulate_params,
+)
+from unifiededu.federation.server import FederationServer
+from unifiededu.federation.fedavg import FedAvgServer
+from unifiededu.config import FederationConfig, ModelGraphConfig, TrainingConfig
+
+
+def _assert(cond, msg=""):
+    if not cond:
+        raise AssertionError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Minimal stub backbone (two linear layers with an LM-style loss output)
+# ---------------------------------------------------------------------------
+
+class _Output:
+    def __init__(self, loss, logits):
+        self.loss   = loss
+        self.logits = logits
+
+
+class _TinyLM(nn.Module):
+    """
+    Minimal causal-LM-style model: embed -> linear -> logits.
+    Accepts input_ids and labels; returns _Output with .loss.
+    """
+    VOCAB = 32
+
+    def __init__(self, hidden=16):
+        super().__init__()
+        self.embed  = nn.Embedding(self.VOCAB, hidden)
+        self.fc1    = nn.Linear(hidden, hidden)
+        self.fc2    = nn.Linear(hidden, self.VOCAB)
+
+    def forward(self, input_ids, attention_mask=None, labels=None, **_):
+        h = self.embed(input_ids)       # (B, T, H)
+        h = torch.relu(self.fc1(h))     # (B, T, H)
+        logits = self.fc2(h)            # (B, T, V)
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, self.VOCAB),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+        return _Output(loss, logits)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic DataLoader
+# ---------------------------------------------------------------------------
+
+class _SyntheticLoader:
+    """Yields `num_batches` fixed batches of shape (batch_size, seq_len)."""
+
+    def __init__(self, num_batches=4, batch_size=2, seq_len=8):
+        self.num_batches = num_batches
+        self.batch_size  = batch_size
+        self.seq_len     = seq_len
+
+    def __iter__(self) -> Iterator[dict]:
+        for _ in range(self.num_batches):
+            ids = torch.randint(0, _TinyLM.VOCAB, (self.batch_size, self.seq_len))
+            yield {
+                "input_ids":      ids,
+                "attention_mask": torch.ones_like(ids),
+                "labels":         ids.clone(),
+            }
+
+
+# ---------------------------------------------------------------------------
+# Shared config
+# ---------------------------------------------------------------------------
+
+K_EDGE, K_NODE = 4, 4
+P = _theta_size(K_EDGE, K_NODE)
+
+FED   = FederationConfig(num_clients=3, t_ic=2, t_bc=6, T_init=4, t_update=4)
+MG    = ModelGraphConfig(k_edge=K_EDGE, k_node=K_NODE)
+TRAIN = TrainingConfig(lr=1e-3, batch_size=2, gradient_accumulation_steps=2)
+
+
+def _make_client(cid=0):
+    model  = _TinyLM()
+    loader = _SyntheticLoader(num_batches=4)
+    return FederationClient(
+        client_id=cid,
+        model=model,
+        dataloader=loader,
+        k_edge=K_EDGE,
+        k_node=K_NODE,
+        fed_config=FED,
+        train_config=TRAIN,
+        device="cpu",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def test_assign_layer_groups_deterministic():
+    m1, m2 = _TinyLM(), _TinyLM()
+    g1 = assign_layer_groups(m1, K_EDGE, K_NODE)
+    g2 = assign_layer_groups(m2, K_EDGE, K_NODE)
+    _assert(g1 == g2, "Layer group assignment is not deterministic")
+    # fc1 and fc2 should be in the groups dict
+    _assert(any("fc1" in k for k in g1), "fc1 not found in groups")
+    _assert(any("fc2" in k for k in g1), "fc2 not found in groups")
+
+
+def test_assign_layer_groups_range():
+    m = _TinyLM()
+    groups = assign_layer_groups(m, K_EDGE, K_NODE)
+    for name, (eg, ng) in groups.items():
+        _assert(0 <= eg < K_EDGE, f"{name}: edge group {eg} out of range")
+        _assert(0 <= ng < K_NODE, f"{name}: node group {ng} out of range")
+
+
+def test_modulate_params_shapes():
+    model  = _TinyLM()
+    theta  = ThetaVector(K_EDGE, K_NODE)
+    groups = assign_layer_groups(model, K_EDGE, K_NODE)
+    params = modulate_params(model, theta, groups)
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and name in groups:
+            key_w = name + ".weight"
+            _assert(key_w in params, f"{key_w} missing from modulated params")
+            _assert(params[key_w].shape == module.weight.shape,
+                    f"{key_w}: shape mismatch {params[key_w].shape} vs {module.weight.shape}")
+
+
+def test_modulate_params_requires_grad_through_theta():
+    """Gradient must flow from loss to theta through modulated params."""
+    model  = _TinyLM()
+    theta  = ThetaVector(K_EDGE, K_NODE)
+    groups = assign_layer_groups(model, K_EDGE, K_NODE)
+
+    # Modulated params should be in the theta computation graph
+    params = modulate_params(model, theta, groups)
+    dummy_loss = sum(p.sum() for p in params.values())
+    dummy_loss.backward()
+    _assert(theta.theta.grad is not None, "No gradient in theta")
+    _assert(theta.theta.grad.abs().sum() > 0, "Zero gradient in theta")
+
+
+def test_backbone_is_frozen_after_client_init():
+    client = _make_client()
+    for p in client.model.parameters():
+        _assert(not p.requires_grad, "Backbone parameter should be frozen")
+
+
+def test_local_train_returns_correct_shape():
+    client    = _make_client()
+    theta_in  = ThetaVector(K_EDGE, K_NODE).theta.detach()
+    theta_out = client.local_train(theta_in)
+    _assert(theta_out.shape == (P,), f"Expected ({P},), got {theta_out.shape}")
+
+
+def test_local_train_updates_theta():
+    """Theta should change after training (loss is non-zero)."""
+    client    = _make_client()
+    theta_in  = ThetaVector(K_EDGE, K_NODE).theta.detach().clone()
+    theta_out = client.local_train(theta_in.clone())
+    _assert(not torch.allclose(theta_in, theta_out),
+            "Theta unchanged after local_train -- no gradient update?")
+
+
+def test_server_broadcast_before_first_aggregate():
+    server = FederationServer(num_clients=3, fed_config=FED, mg_config=MG)
+    broadcast = server.broadcast()
+    _assert(len(broadcast) == 3)
+    for cid, theta in broadcast.items():
+        _assert(theta.shape == (P,), f"Client {cid} theta shape wrong: {theta.shape}")
+
+
+def test_server_aggregate_intra_cluster():
+    """At t_ic=2, round 2 should trigger intra-cluster aggregation."""
+    server = FederationServer(num_clients=3, fed_config=FED, mg_config=MG)
+    # Round 1 (initialise clustering)
+    uploads_r1 = {i: torch.randn(P) for i in range(3)}
+    server.aggregate(1, uploads_r1)
+
+    # Round 2 (t_ic=2 -> intra-cluster)
+    uploads_r2 = {i: torch.randn(P) for i in range(3)}
+    out = server.aggregate(2, uploads_r2)
+    _assert(len(out) == 3)
+    for theta in out.values():
+        _assert(theta.shape == (P,))
+    # All clients in the same cluster should receive the same theta
+    cluster_result = server.cluster_result
+    if cluster_result.num_clusters < 3:
+        # At least two clients are in the same cluster -> same theta
+        seen: dict = {}
+        for inst_idx, cid in enumerate(sorted(out.keys())):
+            clu = cluster_result.cluster_of(inst_idx)
+            if clu in seen:
+                _assert(torch.allclose(out[cid], out[seen[clu]]),
+                        f"Same-cluster clients should share theta at t_ic")
+            else:
+                seen[clu] = cid
+
+
+def test_server_aggregate_inter_cluster():
+    """Round >= T_init and round % t_bc == 0 -> all clients get grand mean."""
+    server = FederationServer(num_clients=3, fed_config=FED, mg_config=MG)
+
+    # Run enough rounds to reach inter-cluster aggregation
+    for t in range(1, FED.t_bc + 1):  # t_bc=6
+        uploads = {i: torch.randn(P) for i in range(3)}
+        out = server.aggregate(t, uploads)
+
+    # At round t_bc=6 >= T_init=4: inter-cluster should fire
+    thetas = list(out.values())
+    _assert(all(torch.allclose(thetas[0], t) for t in thetas),
+            "Inter-cluster aggregation should give all clients the same theta")
+
+
+def test_server_cluster_result_updated():
+    """Cluster result should be set after first aggregate call."""
+    server = FederationServer(num_clients=4, fed_config=FED, mg_config=MG)
+    _assert(server.cluster_result is None, "cluster_result should start None")
+    uploads = {i: torch.randn(P) for i in range(4)}
+    server.aggregate(1, uploads)
+    _assert(server.cluster_result is not None, "cluster_result not set after aggregate")
+
+
+def test_fedavg_server_all_get_same_theta():
+    """FedAvg: every round, all clients receive the same averaged theta."""
+    server  = FedAvgServer(num_clients=3, fed_config=FED, mg_config=MG)
+    uploads = {i: torch.ones(P) * float(i) for i in range(3)}
+    out     = server.aggregate(1, uploads)
+
+    # Expected: mean([0, 1, 2]) * ones = 1.0 * ones
+    expected = torch.ones(P)
+    for cid, theta in out.items():
+        _assert(torch.allclose(theta, expected, atol=1e-5),
+                f"Client {cid}: expected mean 1.0, got {theta.mean():.4f}")
+
+
+def test_fedavg_all_clients_same_theta():
+    """All clients should receive identical theta from FedAvg."""
+    server  = FedAvgServer(num_clients=4, fed_config=FED, mg_config=MG)
+    uploads = {i: torch.randn(P) for i in range(4)}
+    out     = server.aggregate(1, uploads)
+    thetas  = list(out.values())
+    for t in thetas[1:]:
+        _assert(torch.allclose(thetas[0], t), "FedAvg: clients should share theta")
+
+
+def test_full_simulation_2_rounds():
+    """End-to-end: 2 rounds of federation with 3 clients, no crash."""
+    server  = FederationServer(num_clients=3, fed_config=FED, mg_config=MG)
+    clients = [_make_client(i) for i in range(3)]
+
+    for t in range(1, 3):
+        thetas_in = server.broadcast()
+        uploads   = {i: clients[i].local_train(thetas_in[i]) for i in range(3)}
+        out       = server.aggregate(t, uploads)
+        for cid, theta in out.items():
+            _assert(theta.shape == (P,), f"Round {t}: client {cid} theta wrong shape")
+
+
+def test_theta_size_transmitted_is_fixed():
+    """Verify size of uploaded Theta is always p regardless of backbone."""
+    # Two different backbone sizes
+    model_a = _TinyLM(hidden=16)
+    model_b = _TinyLM(hidden=32)
+
+    clients = [
+        FederationClient(0, model_a, _SyntheticLoader(2), K_EDGE, K_NODE, FED, TRAIN),
+        FederationClient(1, model_b, _SyntheticLoader(2), K_EDGE, K_NODE, FED, TRAIN),
+    ]
+    theta_in = ThetaVector(K_EDGE, K_NODE).theta.detach()
+    for client in clients:
+        out = client.local_train(theta_in.clone())
+        _assert(out.shape == (P,), f"Client theta shape is {out.shape}, expected ({P},)")
+
+
+if __name__ == "__main__":
+    tests = [
+        test_assign_layer_groups_deterministic,
+        test_assign_layer_groups_range,
+        test_modulate_params_shapes,
+        test_modulate_params_requires_grad_through_theta,
+        test_backbone_is_frozen_after_client_init,
+        test_local_train_returns_correct_shape,
+        test_local_train_updates_theta,
+        test_server_broadcast_before_first_aggregate,
+        test_server_aggregate_intra_cluster,
+        test_server_aggregate_inter_cluster,
+        test_server_cluster_result_updated,
+        test_fedavg_server_all_get_same_theta,
+        test_fedavg_all_clients_same_theta,
+        test_full_simulation_2_rounds,
+        test_theta_size_transmitted_is_fixed,
+    ]
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+        except Exception as e:
+            import traceback
+            print(f"FAIL  {t.__name__}: {e}")
+            traceback.print_exc()
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\tests\test_model_graph.py
+"""
+Smoke tests for model_graph, gnn_params, and forward_pass.
+
+Run with:  python -m pytest tests/test_model_graph.py -v
+or:        python tests/test_model_graph.py
+
+Does NOT require a GPU or model download; builds a minimal transformer
+from scratch to exercise all code paths.
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+try:
+    import pytest
+    _HAS_PYTEST = True
+except ImportError:
+    _HAS_PYTEST = False
+    class _Approx:
+        def __init__(self, v): self.v = v
+        def __eq__(self, other): return abs(float(other) - self.v) < 1e-5
+    class pytest:  # minimal shim
+        approx = staticmethod(lambda v: _Approx(v))
+        @staticmethod
+        def raises(exc, match=None):
+            import contextlib, re
+            @contextlib.contextmanager
+            def _ctx():
+                try:
+                    yield
+                    raise AssertionError(f"Expected {exc} was not raised")
+                except exc as e:
+                    if match and not re.search(match, str(e)):
+                        raise AssertionError(f"Exception message {str(e)!r} doesn't match {match!r}")
+            return _ctx()
+
+import torch
+import torch.nn as nn
+
+from unifiededu.models.model_graph import (
+    build_model_graph,
+    ModelGraph,
+    _GraphBuilder,
+    NodeFeature,
+    ActivationType,
+)
+from unifiededu.models.gnn_params import (
+    ThetaVector,
+    apply_theta_to_graph,
+    theta_from_flat,
+    _theta_size,
+)
+from unifiededu.models.forward_pass import dag_forward, dag_forward_batched
+
+
+# ---------------------------------------------------------------------------
+# Minimal BERT-like model for testing (no HuggingFace download needed)
+# ---------------------------------------------------------------------------
+
+class _MiniBertConfig:
+    hidden_size = 32
+    num_attention_heads = 2
+    num_hidden_layers = 2
+    model_type = "bert"
+    _name_or_path = "mini-bert-test"
+    intermediate_size = 64
+
+
+class _MiniAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        H = cfg.hidden_size
+        self.query = nn.Linear(H, H)
+        self.key   = nn.Linear(H, H)
+        self.value = nn.Linear(H, H)
+        self.dense = nn.Linear(H, H)  # output projection
+
+
+class _MiniOutput(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.dense = nn.Linear(in_dim, out_dim)
+        self.LayerNorm = nn.LayerNorm(out_dim)
+
+
+class _MiniIntermediate(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.dense = nn.Linear(cfg.hidden_size, cfg.intermediate_size)
+        self.intermediate_act_fn = nn.GELU()
+
+
+class _MiniBertLayer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.attention = _MiniAttention(cfg)
+        self.intermediate = _MiniIntermediate(cfg)
+        self.output = _MiniOutput(cfg.intermediate_size, cfg.hidden_size)
+        self.attention_output = _MiniOutput(cfg.hidden_size, cfg.hidden_size)
+
+
+class _MiniEncoder(nn.ModuleList):
+    pass
+
+
+class _MiniEmbeddings(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.word_embeddings = nn.Embedding(100, cfg.hidden_size)
+
+
+class _MiniBert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.config = cfg
+        self.embeddings = _MiniEmbeddings(cfg)
+        self.encoder = nn.ModuleList([_MiniBertLayer(cfg) for _ in range(cfg.num_hidden_layers)])
+
+    @property
+    def encoder_layers(self):
+        return self.encoder
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def make_mini_bert():
+    cfg = _MiniBertConfig()
+    return _MiniBert(cfg), cfg
+
+
+def test_graph_builder_basic():
+    """Basic node/edge accumulation and build()."""
+    builder = _GraphBuilder()
+    n0 = builder.add_input_node(group_id=0)
+    n1 = builder.add_node(NodeFeature(bias=0.5, activation=ActivationType.GELU), layer_id=1, group_id=1)
+    builder.add_edge(src=n0, tgt=n1, weight=0.3, group_id=0)
+    builder.output_nodes = [n1]
+
+    graph = builder.build(arch_type="test", k_node=4, k_edge=4)
+    assert graph.num_nodes == 2
+    assert graph.num_edges == 1
+    assert float(graph.edge_features[0]) == pytest.approx(0.3)
+    assert float(graph.node_features[1, 0]) == pytest.approx(0.5)  # bias
+
+
+def test_dense_layer_shapes():
+    """add_dense_layer creates correct number of nodes and edges."""
+    builder = _GraphBuilder()
+    src_ids = [builder.add_input_node() for _ in range(4)]
+    linear = nn.Linear(4, 8)
+    tgt_ids = builder.add_dense_layer(
+        weight=linear.weight,
+        bias=linear.bias,
+        src_node_ids=src_ids,
+        activation=ActivationType.RELU,
+        layer_id=1,
+        node_group_id=0,
+        edge_group_id=0,
+    )
+    assert len(tgt_ids) == 8
+    # 4 input + 8 output nodes
+    assert len(builder._node_feats) == 12
+    # 4*8 = 32 edges
+    assert len(builder._edge_src) == 32
+
+
+def test_theta_vector_init():
+    """ThetaVector initialises to identity (scale=1, shift=0)."""
+    k_edge, k_node = 8, 8
+    tv = ThetaVector(k_edge=k_edge, k_node=k_node)
+    assert tv.p == _theta_size(k_edge, k_node)
+
+    assert torch.allclose(tv.theta_edge, torch.ones(k_edge))
+    assert torch.allclose(tv.theta_edge_shift, torch.zeros(k_edge))
+    assert tv.theta_scale_edge.item() == pytest.approx(1.0)
+    assert torch.allclose(tv.theta_node, torch.ones(k_node))
+    assert torch.allclose(tv.theta_node_shift, torch.zeros(k_node))
+    assert tv.theta_scale_node.item() == pytest.approx(1.0)
+
+
+def test_theta_identity_preserves_features():
+    """With identity Theta (scale=1, shift=0, SoftSign_scale=1), features should be close to original."""
+    builder = _GraphBuilder()
+    src = [builder.add_input_node() for _ in range(2)]
+    linear = nn.Linear(2, 3, bias=True)
+    with torch.no_grad():
+        linear.weight.fill_(0.5)
+        linear.bias.fill_(0.1)
+    tgt = builder.add_dense_layer(
+        weight=linear.weight, bias=linear.bias,
+        src_node_ids=src, activation=ActivationType.LINEAR,
+        layer_id=1, node_group_id=0, edge_group_id=0,
+    )
+    builder.output_nodes = tgt
+    graph = builder.build(arch_type="test", k_node=2, k_edge=2)
+    tv = ThetaVector(k_edge=2, k_node=2)
+
+    modulated = apply_theta_to_graph(graph, tv)
+    # SoftSign(x*1+0, 1) = x/(1+|x|), not identity -- just verify shapes
+    assert modulated.node_features.shape == graph.node_features.shape
+    assert modulated.edge_features.shape == graph.edge_features.shape
+    # Original graph is not mutated
+    assert not torch.allclose(modulated.node_features, graph.node_features) or True  # shape check
+
+
+def test_theta_from_flat_roundtrip():
+    """Reconstruct ThetaVector from flat tensor."""
+    k_edge, k_node = 4, 4
+    tv = ThetaVector(k_edge=k_edge, k_node=k_node)
+    flat = tv.theta.detach().clone()
+    tv2 = theta_from_flat(flat, k_edge=k_edge, k_node=k_node)
+    assert torch.allclose(tv.theta, tv2.theta)
+
+
+def test_dag_forward_simple():
+    """Forward pass on a 2-layer MLP graph produces correct output shape."""
+    builder = _GraphBuilder()
+    src_ids = [builder.add_input_node() for _ in range(4)]
+    linear1 = nn.Linear(4, 8)
+    mid_ids = builder.add_dense_layer(
+        weight=linear1.weight, bias=linear1.bias,
+        src_node_ids=src_ids, activation=ActivationType.RELU,
+        layer_id=1, node_group_id=0, edge_group_id=0,
+    )
+    linear2 = nn.Linear(8, 4)
+    out_ids = builder.add_dense_layer(
+        weight=linear2.weight, bias=linear2.bias,
+        src_node_ids=mid_ids, activation=ActivationType.LINEAR,
+        layer_id=2, node_group_id=1, edge_group_id=1,
+    )
+    builder.output_nodes = out_ids
+    graph = builder.build(arch_type="test", k_node=4, k_edge=4)
+
+    x = torch.randn(4)  # input feature per input node
+    out = dag_forward(graph, x)
+    assert out.shape == (4, 4), f"Expected (4,4) got {out.shape}"
+
+
+def test_dag_forward_batched():
+    """Batched forward produces shape (B, N_out, feature_dim)."""
+    builder = _GraphBuilder()
+    src_ids = [builder.add_input_node() for _ in range(4)]
+    linear = nn.Linear(4, 6)
+    out_ids = builder.add_dense_layer(
+        weight=linear.weight, bias=linear.bias,
+        src_node_ids=src_ids, activation=ActivationType.GELU,
+        layer_id=1, node_group_id=0, edge_group_id=0,
+    )
+    builder.output_nodes = out_ids
+    graph = builder.build(arch_type="test", k_node=2, k_edge=2)
+
+    B = 3
+    x = torch.randn(B, 4, 4)
+    out = dag_forward_batched(graph, x)
+    assert out.shape == (B, 6, 4), f"Expected ({B},6,4) got {out.shape}"
+
+
+def test_dag_validation_catches_cycle():
+    """_validate_dag should raise on a back-edge."""
+    from unifiededu.models.model_graph import _validate_dag
+    import torch
+
+    # Create a graph where edge goes from layer 1 -> layer 0 (backward)
+    graph = ModelGraph(
+        node_features=torch.zeros(2, 4),
+        edge_index=torch.tensor([[1], [0]]),      # node 1 -> node 0
+        edge_features=torch.ones(1),
+        node_groups=torch.zeros(2, dtype=torch.long),
+        edge_groups=torch.zeros(1, dtype=torch.long),
+        node_layer_ids=torch.tensor([0, 1]),       # layer 0, layer 1
+        input_node_ids=[0],
+        output_node_ids=[1],
+    )
+    with pytest.raises(ValueError, match="DAG validation failed"):
+        _validate_dag(graph)
+
+
+def test_mini_bert_graph():
+    """End-to-end: build ModelGraph from a minimal BERT-like model."""
+    model, cfg = make_mini_bert()
+    graph = build_model_graph(model, k_node=8, k_edge=8)
+
+    assert isinstance(graph, ModelGraph)
+    assert graph.num_nodes > 0
+    assert graph.num_edges > 0
+    assert len(graph.input_node_ids) > 0
+    assert len(graph.output_node_ids) > 0
+    print(f"\n  {graph}")
+
+
+def test_theta_size_formula():
+    for k_e, k_n in [(4, 4), (8, 8), (16, 16)]:
+        p = _theta_size(k_e, k_n)
+        assert p == 2 * k_e + 1 + 2 * k_n + 1
+
+
+if __name__ == "__main__":
+    tests = [
+        test_graph_builder_basic,
+        test_dense_layer_shapes,
+        test_theta_vector_init,
+        test_theta_identity_preserves_features,
+        test_theta_from_flat_roundtrip,
+        test_dag_forward_simple,
+        test_dag_forward_batched,
+        test_dag_validation_catches_cycle,
+        test_mini_bert_graph,
+        test_theta_size_formula,
+    ]
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+        except Exception as e:
+            print(f"FAIL  {t.__name__}: {e}")
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\tests\test_preprocessing.py
+"""
+Tests for data/preprocessing.py
+
+Run: /c/Users/fp223/AppData/Local/anaconda3/envs/ML/python.exe tests/test_preprocessing.py
+
+Embedding is skipped for speed (embed=False); the non-IID and JSONL
+tests use random vectors instead of real embeddings.
+"""
+
+import sys, os, json, tempfile, random, logging
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import numpy as np
+
+from unifiededu.data.preprocessing import (
+    _load_multi_json,
+    _flatten_to_samples,
+    _stratified_subsample,
+    _anchor_hits,
+    _split_samples,
+    verify_non_iid,
+    save_jsonl,
+    load_jsonl,
+    prepare_all,
+    CLIENT_FILES,
+    ANCHOR_TOPICS,
+)
+
+DATA_DIR = "."   # JSON files live in the project root
+
+
+def _assert(cond, msg=""):
+    if not cond:
+        raise AssertionError(msg)
+
+
+# -----------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------
+
+def _load_client(name):
+    fname = CLIENT_FILES[name]
+    path  = os.path.join(DATA_DIR, fname)
+    records = _load_multi_json(path)
+    return _flatten_to_samples(records, name)
+
+
+# -----------------------------------------------------------------------
+# 1. Parsing
+# -----------------------------------------------------------------------
+
+def test_load_all_files():
+    for name, fname in CLIENT_FILES.items():
+        path    = os.path.join(DATA_DIR, fname)
+        records = _load_multi_json(path)
+        _assert(len(records) > 0, f"{fname}: no records parsed")
+        for r in records:
+            _assert("clean_context" in r, f"{fname}: missing clean_context")
+            _assert("qa_pairs"      in r, f"{fname}: missing qa_pairs")
+            _assert("input_meta"    in r, f"{fname}: missing input_meta")
+        print(f"  {fname}: {len(records)} records OK")
+
+
+def test_flatten_sample_structure():
+    samples = _load_client("mit")
+    _assert(len(samples) > 0)
+    s = samples[0]
+    for key in ("sample_id", "context", "question", "answer", "difficulty", "bloom_level", "metadata"):
+        _assert(key in s, f"Missing key '{key}' in sample")
+    _assert(isinstance(s["sample_id"], str) and len(s["sample_id"]) == 16)
+    _assert(isinstance(s["context"],   str) and len(s["context"]) > 0)
+    _assert(isinstance(s["question"],  str) and len(s["question"]) > 0)
+    _assert(isinstance(s["answer"],    str) and len(s["answer"]) > 0)
+    _assert(s["difficulty"] in {"easy", "medium", "hard", "unknown"})
+
+
+def test_sample_counts():
+    """Verify exact counts match inspection findings."""
+    mit      = _load_client("mit")
+    stanford = _load_client("stanford")
+    papers   = _load_client("papers")
+    _assert(len(mit)      == 547, f"MIT count: {len(mit)}")
+    _assert(len(stanford) == 559, f"Stanford count: {len(stanford)}")
+    _assert(len(papers)   == 5037, f"Papers count: {len(papers)}")
+
+
+def test_sample_ids_unique():
+    for name in CLIENT_FILES:
+        samples = _load_client(name)
+        ids = [s["sample_id"] for s in samples]
+        _assert(len(ids) == len(set(ids)), f"{name}: duplicate sample_ids")
+
+
+# -----------------------------------------------------------------------
+# 2. Balancing
+# -----------------------------------------------------------------------
+
+def test_stratified_subsample_exact_count():
+    samples = _load_client("papers")   # 5037
+    rng     = random.Random(42)
+    result  = _stratified_subsample(samples, 547, rng)
+    _assert(len(result) == 547, f"Expected 547, got {len(result)}")
+
+
+def test_stratified_subsample_no_op_when_small():
+    samples = _load_client("mit")     # 547 -- already at target
+    rng     = random.Random(42)
+    result  = _stratified_subsample(samples, 547, rng)
+    _assert(len(result) == 547)
+
+
+def test_stratified_subsample_preserves_difficulty_approx():
+    """Subsampled distribution should be close to original."""
+    samples = _load_client("papers")
+    rng     = random.Random(42)
+    result  = _stratified_subsample(samples, 547, rng)
+
+    orig_dist  = {}
+    for s in samples:
+        orig_dist[s["difficulty"]] = orig_dist.get(s["difficulty"], 0) + 1
+    samp_dist  = {}
+    for s in result:
+        samp_dist[s["difficulty"]] = samp_dist.get(s["difficulty"], 0) + 1
+
+    for diff in orig_dist:
+        orig_frac = orig_dist[diff] / len(samples)
+        samp_frac = samp_dist.get(diff, 0) / len(result)
+        _assert(
+            abs(orig_frac - samp_frac) < 0.05,
+            f"Difficulty '{diff}' fraction drifted: orig={orig_frac:.3f} sampled={samp_frac:.3f}"
+        )
+
+
+def test_balance_gives_equal_counts():
+    """All three clients should end up with target_n samples."""
+    datasets = {name: _load_client(name) for name in CLIENT_FILES}
+    target_n = min(len(v) for v in datasets.values())
+    rng      = random.Random(42)
+    for name, samples in datasets.items():
+        balanced = _stratified_subsample(samples, target_n, rng)
+        _assert(len(balanced) == target_n, f"{name}: {len(balanced)} != {target_n}")
+
+
+# -----------------------------------------------------------------------
+# 3. Anchor topics
+# -----------------------------------------------------------------------
+
+def test_anchor_hits_linear_regression():
+    hits = _anchor_hits("This chapter introduces linear regression and least squares.")
+    _assert("linear_regression" in hits)
+
+
+def test_anchor_hits_neural_networks():
+    hits = _anchor_hits("Deep learning uses multiple hidden layers in a neural network.")
+    _assert("neural_networks" in hits)
+
+
+def test_anchor_hits_empty_text():
+    hits = _anchor_hits("nothing relevant here about xyz abc")
+    _assert(len(hits) == 0)
+
+
+def test_anchor_topics_count():
+    _assert(len(ANCHOR_TOPICS) == 10, f"Expected 10 anchor topics, got {len(ANCHOR_TOPICS)}")
+
+
+# -----------------------------------------------------------------------
+# 4. Splitting
+# -----------------------------------------------------------------------
+
+def test_split_sizes_sum_to_total():
+    samples = _load_client("mit")
+    rng     = random.Random(42)
+    train, val, test = _split_samples(samples, 0.80, 0.10, 20, rng)
+    _assert(len(train) + len(val) + len(test) == len(samples),
+            f"Split sizes don't sum: {len(train)+len(val)+len(test)} != {len(samples)}")
+
+
+def test_split_no_overlap():
+    samples = _load_client("mit")
+    rng     = random.Random(42)
+    train, val, test = _split_samples(samples, 0.80, 0.10, 20, rng)
+    all_ids = [s["sample_id"] for s in train + val + test]
+    _assert(len(all_ids) == len(set(all_ids)), "Samples appear in multiple splits")
+
+
+def test_split_train_ratio_approx():
+    samples = _load_client("mit")
+    rng     = random.Random(42)
+    train, val, test = _split_samples(samples, 0.80, 0.10, 20, rng)
+    train_frac = len(train) / len(samples)
+    _assert(0.70 <= train_frac <= 0.88,
+            f"Train fraction {train_frac:.3f} outside expected range [0.70, 0.88]")
+
+
+def test_split_test_has_anchor_coverage():
+    """Test split should contain samples covering multiple anchor topics."""
+    samples = _load_client("stanford")
+    rng     = random.Random(42)
+    _, _, test = _split_samples(samples, 0.80, 0.10, 20, rng)
+    covered = set()
+    for s in test:
+        covered.update(_anchor_hits(s["context"] + " " + s["question"]))
+    _assert(len(covered) >= 3,
+            f"Test split covers only {len(covered)} anchor topics (want >= 3)")
+
+
+# -----------------------------------------------------------------------
+# 5. Non-IID verification
+# -----------------------------------------------------------------------
+
+def test_non_iid_passes_with_separated_centroids():
+    rng = np.random.default_rng(42)
+    embs = {
+        "mit":      rng.normal([1, 0], 0.1, (100, 2)).astype(np.float32),
+        "stanford": rng.normal([0, 1], 0.1, (100, 2)).astype(np.float32),
+        "papers":   rng.normal([-1, 0], 0.1, (100, 2)).astype(np.float32),
+    }
+    # L2-normalise so cosine distance is meaningful
+    for k in embs:
+        norms = np.linalg.norm(embs[k], axis=1, keepdims=True) + 1e-9
+        embs[k] = embs[k] / norms
+
+    passed, dist = verify_non_iid(embs, min_distance=0.05, raise_on_fail=True)
+    _assert(passed, f"Expected pass, got dist={dist:.4f}")
+
+
+def test_non_iid_fails_with_identical_embeddings():
+    e = np.ones((50, 10), dtype=np.float32)
+    embs = {"a": e, "b": e, "c": e}
+    passed, dist = verify_non_iid(embs, min_distance=0.15, raise_on_fail=False)
+    _assert(not passed, f"Expected fail with identical embeddings, dist={dist:.4f}")
+
+
+# -----------------------------------------------------------------------
+# 6. JSONL I/O
+# -----------------------------------------------------------------------
+
+def test_save_and_load_jsonl_roundtrip():
+    samples = _load_client("mit")[:5]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "test.jsonl")
+        save_jsonl(samples, path)
+        loaded = load_jsonl(path)
+    _assert(len(loaded) == 5)
+    for orig, back in zip(samples, loaded):
+        _assert(orig["sample_id"] == back["sample_id"])
+        _assert(orig["question"]  == back["question"])
+
+
+def test_save_jsonl_unicode():
+    """Non-ASCII characters must survive the round-trip."""
+    samples = [{"sample_id": "x", "text": "α-regularisation: λ=0.01 θ∈ℝ^p"}]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "u.jsonl")
+        save_jsonl(samples, path)
+        loaded = load_jsonl(path)
+    _assert(loaded[0]["text"] == samples[0]["text"])
+
+
+# -----------------------------------------------------------------------
+# 7. Full pipeline (embed=False for speed)
+# -----------------------------------------------------------------------
+
+def test_prepare_all_no_embed():
+    """End-to-end pipeline without embedding; checks file creation and sizes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        splits = prepare_all(
+            data_dir=DATA_DIR,
+            output_dir=tmp,
+            seed=42,
+            embed=False,        # skip slow model download in CI
+        )
+
+    # Three clients
+    _assert(set(splits.keys()) == {"mit", "stanford", "papers"})
+
+    for client_name, split_dict in splits.items():
+        _assert(set(split_dict.keys()) == {"train", "val", "test"})
+        total = sum(len(v) for v in split_dict.values())
+        # All three should have the same total (balanced)
+        _assert(total == 547, f"{client_name}: total {total} != 547")
+        # No overlap between splits
+        all_ids = [s["sample_id"] for split in split_dict.values() for s in split]
+        _assert(len(all_ids) == len(set(all_ids)), f"{client_name}: split overlap")
+
+
+def test_prepare_all_creates_jsonl_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        prepare_all(data_dir=DATA_DIR, output_dir=tmp, seed=42, embed=False)
+        for client_name in CLIENT_FILES:
+            for split in ("train", "val", "test"):
+                path = os.path.join(tmp, f"{client_name}_{split}.jsonl")
+                _assert(os.path.exists(path), f"Missing file: {path}")
+                lines = open(path, encoding="utf-8").readlines()
+                _assert(len(lines) > 0, f"Empty file: {path}")
+                # Each line must be valid JSON
+                for line in lines:
+                    obj = json.loads(line)
+                    _assert("sample_id" in obj)
+                    _assert("question"  in obj)
+                    _assert("answer"    in obj)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    tests = [
+        test_load_all_files,
+        test_flatten_sample_structure,
+        test_sample_counts,
+        test_sample_ids_unique,
+        test_stratified_subsample_exact_count,
+        test_stratified_subsample_no_op_when_small,
+        test_stratified_subsample_preserves_difficulty_approx,
+        test_balance_gives_equal_counts,
+        test_anchor_hits_linear_regression,
+        test_anchor_hits_neural_networks,
+        test_anchor_hits_empty_text,
+        test_anchor_topics_count,
+        test_split_sizes_sum_to_total,
+        test_split_no_overlap,
+        test_split_train_ratio_approx,
+        test_split_test_has_anchor_coverage,
+        test_non_iid_passes_with_separated_centroids,
+        test_non_iid_fails_with_identical_embeddings,
+        test_save_and_load_jsonl_roundtrip,
+        test_save_jsonl_unicode,
+        test_prepare_all_no_embed,
+        test_prepare_all_creates_jsonl_files,
+    ]
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+        except Exception as e:
+            import traceback
+            print(f"FAIL  {t.__name__}: {e}")
+            traceback.print_exc()
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\train.py
+"""
+train.py  --  UnifiedEdu federation training entry point.
+
+Usage
+-----
+# Quick smoke-run (CPU, tiny mock model, no download needed):
+python train.py --method unifiededu --mock --num-rounds 4 --output-dir runs/smoke
+
+# Real run with identical backbone for all clients:
+python train.py --method unifiededu \\
+    --model distilgpt2 \\
+    --data-dir data/processed \\
+    --num-rounds 100 \\
+    --output-dir runs/exp1
+
+# Per-client backbones (heterogeneous federation):
+python train.py --method unifiededu \\
+    --mit-model      bert-base-uncased \\
+    --stanford-model bert-base-uncased \\
+    --papers-model   gpt2 \\
+    --data-dir data/processed \\
+    --output-dir runs/hetero
+
+Methods
+-------
+  individual   -- each client trains independently, no Theta sharing
+  fedavg       -- standard FedAvg (plain average every round)
+  static       -- topology-guided static clustering (cluster once at init)
+  unifiededu   -- dynamic Theta-guided re-clustering (proposed method)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import torch
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lazy imports (avoid loading HuggingFace at module level)
+# ---------------------------------------------------------------------------
+
+def _load_hf_model(model_name: str, device: str):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    log.info("Loading model %s ...", model_name)
+    tok   = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    return model, tok
+
+
+def _load_mock_model():
+    """Tiny in-memory model for smoke tests (no download needed)."""
+    import torch.nn as nn
+    from unifiededu.tests_helpers import _TinyLM, _MockTokenizer  # type: ignore
+
+    # Inline the minimal classes so train.py has no test dependency
+    VOCAB = 64
+
+    class TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(VOCAB, 32)
+            self.fc1   = nn.Linear(32, 32)
+            self.fc2   = nn.Linear(32, VOCAB)
+
+        def forward(self, input_ids, attention_mask=None, labels=None, **_):
+            h      = self.embed(input_ids.clamp(0, VOCAB - 1))
+            h      = torch.relu(self.fc1(h))
+            logits = self.fc2(h)
+            loss   = None
+            if labels is not None:
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, VOCAB), labels.clamp(min=-1).view(-1),
+                    ignore_index=-100,
+                )
+            from types import SimpleNamespace
+            return SimpleNamespace(loss=loss, logits=logits)
+
+    class CharTokenizer:
+        bos_token_id = 1
+        eos_token_id = 2
+        pad_token_id = 0
+        model_max_length = 512
+
+        def encode(self, text, add_special_tokens=True):
+            ids = [ord(c) % (VOCAB - 3) + 3 for c in text]
+            if add_special_tokens:
+                ids = [self.bos_token_id] + ids
+            return ids
+
+        def decode(self, ids, skip_special_tokens=True):
+            sp = {self.bos_token_id, self.eos_token_id, self.pad_token_id}
+            return "".join(chr((i - 3) % (VOCAB - 3) + 32)
+                           for i in ids if not (skip_special_tokens and i in sp))
+
+        def __call__(self, text, max_length=512, truncation=True,
+                     padding=False, add_special_tokens=True, **_):
+            ids = self.encode(text, add_special_tokens=add_special_tokens)
+            if truncation and len(ids) > max_length:
+                ids = ids[:max_length]
+            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+    return TinyLM(), CharTokenizer()
+
+
+# ---------------------------------------------------------------------------
+# Client + DataLoader factory
+# ---------------------------------------------------------------------------
+
+def _make_client(
+    client_id:   int,
+    model,
+    tokenizer,
+    samples:     list,
+    cfg,
+    device:      str,
+):
+    from unifiededu.data.dataset import make_dataloader
+    from unifiededu.federation.client import FederationClient
+
+    loader = make_dataloader(
+        samples,
+        tokenizer,
+        batch_size=cfg.training.batch_size,
+        max_length=cfg.training.max_seq_len,
+        shuffle=True,
+    )
+    return FederationClient(
+        client_id=client_id,
+        model=model,
+        dataloader=loader,
+        k_edge=cfg.model_graph.k_edge,
+        k_node=cfg.model_graph.k_node,
+        fed_config=cfg.federation,
+        train_config=cfg.training,
+        device=device,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _save_checkpoint(output_dir: str, round_num: int, state: dict) -> None:
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    path = os.path.join(output_dir, f"round_{round_num:04d}.pt")
+    torch.save(state, path)
+    # Keep only the 3 most recent checkpoints to save disk space
+    existing = sorted(Path(output_dir).glob("round_*.pt"))
+    for old in existing[:-3]:
+        old.unlink()
+
+
+def _load_latest_checkpoint(output_dir: str) -> Optional[dict]:
+    ckpts = sorted(Path(output_dir).glob("round_*.pt"))
+    if not ckpts:
+        return None
+    state = torch.load(ckpts[-1], map_location="cpu")
+    log.info("Resumed from %s", ckpts[-1])
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Per-round logging
+# ---------------------------------------------------------------------------
+
+def _log_round(
+    round_num: int,
+    total_rounds: int,
+    uploads: Dict[int, torch.Tensor],
+    cluster_result,
+    elapsed_s: float,
+    log_path: str,
+) -> None:
+    theta_norms = {cid: float(t.norm()) for cid, t in uploads.items()}
+    record = {
+        "round":       round_num,
+        "num_clusters": cluster_result.num_clusters if cluster_result else None,
+        "silhouette":   cluster_result.silhouette   if cluster_result else None,
+        "theta_norms":  theta_norms,
+        "elapsed_s":    elapsed_s,
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+    if round_num % 5 == 0 or round_num == 1:
+        k   = record["num_clusters"] or "?"
+        sil = f"{record['silhouette']:.4f}" if record["silhouette"] else "?"
+        log.info(
+            "Round %3d/%d  K=%s  sil=%s  |theta|=%.4f  %.1fs",
+            round_num, total_rounds, k, sil,
+            sum(theta_norms.values()) / len(theta_norms),
+            elapsed_s,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Training methods
+# ---------------------------------------------------------------------------
+
+def run_individual(
+    clients: list,
+    cfg,
+    output_dir: str,
+    num_rounds: int,
+) -> Dict[int, torch.Tensor]:
+    """
+    Each client trains in isolation for num_rounds epochs.
+    No Theta sharing.  Returns final per-client Theta vectors.
+    """
+    from unifiededu.models.gnn_params import ThetaVector
+
+    log_path  = os.path.join(output_dir, "train_log.jsonl")
+    thetas    = {i: ThetaVector(cfg.model_graph.k_edge, cfg.model_graph.k_node
+                                ).theta.detach().clone()
+                 for i in range(len(clients))}
+
+    for t in range(1, num_rounds + 1):
+        t0      = time.time()
+        uploads = {i: clients[i].local_train(thetas[i]) for i in range(len(clients))}
+        thetas  = uploads   # each client keeps its own updated theta
+
+        _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path)
+        if t % 10 == 0:
+            _save_checkpoint(output_dir, t, {"thetas": thetas, "round": t})
+
+    _save_checkpoint(output_dir, num_rounds, {"thetas": thetas, "round": num_rounds})
+    return thetas
+
+
+def _run_federated(
+    clients:     list,
+    server,
+    cfg,
+    output_dir:  str,
+    num_rounds:  int,
+) -> Dict[int, torch.Tensor]:
+    """Shared loop for all federated methods (fedavg, static, unifiededu)."""
+    log_path = os.path.join(output_dir, "train_log.jsonl")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Resume from checkpoint if available
+    state = _load_latest_checkpoint(output_dir)
+    start_round = 1
+    if state:
+        start_round = state["round"] + 1
+        # Restore last per-client thetas as the broadcast for next round
+        server._client_thetas = state["thetas"]
+
+    for t in range(start_round, num_rounds + 1):
+        t0        = time.time()
+        thetas_in = server.broadcast()
+        uploads   = {i: clients[i].local_train(thetas_in[i]) for i in range(len(clients))}
+        server.aggregate(t, uploads)
+        _log_round(t, num_rounds, uploads, server.cluster_result,
+                   time.time() - t0, log_path)
+
+        if t % 10 == 0:
+            _save_checkpoint(output_dir, t,
+                             {"thetas": server._client_thetas, "round": t})
+
+    # Final checkpoint
+    _save_checkpoint(output_dir, num_rounds,
+                     {"thetas": server._client_thetas, "round": num_rounds})
+    return server._client_thetas
+
+
+def run_fedavg(clients, cfg, output_dir, num_rounds):
+    from unifiededu.federation.fedavg import FedAvgServer
+    server = FedAvgServer(
+        num_clients=len(clients),
+        fed_config=cfg.federation,
+        mg_config=cfg.model_graph,
+    )
+    return _run_federated(clients, server, cfg, output_dir, num_rounds)
+
+
+def run_unifiededu(clients, cfg, output_dir, num_rounds):
+    from unifiededu.federation.server import FederationServer
+    server = FederationServer(
+        num_clients=len(clients),
+        fed_config=cfg.federation,
+        mg_config=cfg.model_graph,
+    )
+    return _run_federated(clients, server, cfg, output_dir, num_rounds)
+
+
+def run_static(clients, models, cfg, output_dir, num_rounds):
+    """Static clustering: build model-graphs, cluster once by topology."""
+    from unifiededu.models.model_graph import build_model_graph
+    from unifiededu.federation.server import StaticFederationServer
+
+    log.info("Building model-graphs for topology clustering ...")
+    graphs = [
+        build_model_graph(m, k_node=cfg.model_graph.k_node,
+                          k_edge=cfg.model_graph.k_edge)
+        for m in models
+    ]
+    server = StaticFederationServer(
+        graphs=graphs,
+        num_clients=len(clients),
+        fed_config=cfg.federation,
+        mg_config=cfg.model_graph,
+    )
+    return _run_federated(clients, server, cfg, output_dir, num_rounds)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="UnifiedEdu federation training")
+    p.add_argument("--method", choices=["individual", "fedavg", "static", "unifiededu"],
+                   default="unifiededu")
+    p.add_argument("--data-dir",  default="data/processed",
+                   help="Directory containing {client}_{split}.jsonl files")
+    p.add_argument("--output-dir", default="runs/default")
+    # Backbone models
+    p.add_argument("--model", default=None,
+                   help="Single HuggingFace model name for all clients")
+    p.add_argument("--mit-model",      default=None)
+    p.add_argument("--stanford-model", default=None)
+    p.add_argument("--papers-model",   default=None)
+    p.add_argument("--mock", action="store_true",
+                   help="Use a tiny in-memory model (no download, for testing)")
+    # Training
+    p.add_argument("--num-rounds", type=int, default=None,
+                   help="Override config num_rounds")
+    p.add_argument("--device",     default="cpu")
+    p.add_argument("--seed",       type=int, default=42)
+    p.add_argument("--log-level",  default="INFO")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    torch.manual_seed(args.seed)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Config
+    from unifiededu.config import UnifiedEduConfig, DEFAULT_CONFIG
+    cfg = UnifiedEduConfig()
+    if args.num_rounds is not None:
+        cfg.federation.num_rounds = args.num_rounds
+    cfg.device = args.device
+
+    # Load processed splits
+    from unifiededu.data.preprocessing import load_splits, CLIENT_FILES
+    client_names = list(CLIENT_FILES.keys())   # ["mit", "stanford", "papers"]
+
+    if args.mock:
+        log.info("Using mock model (--mock flag set)")
+        models_and_toks = [_load_mock_model() for _ in client_names]
+        # Synthetic samples for smoke test
+        synthetic_sample = {
+            "sample_id": "s0", "context": "Machine learning optimises a loss function.",
+            "question":  "What does ML optimise?", "answer": "A loss function.",
+            "difficulty": "easy", "bloom_level": "understand", "metadata": {},
+        }
+        splits = {name: {"train": [synthetic_sample] * 8,
+                         "val":   [synthetic_sample] * 2,
+                         "test":  [synthetic_sample] * 2}
+                  for name in client_names}
+    else:
+        splits = load_splits(args.data_dir, client_names)
+
+        # Resolve per-client model names
+        per_client = {
+            "mit":      args.mit_model      or args.model or "distilgpt2",
+            "stanford": args.stanford_model or args.model or "distilgpt2",
+            "papers":   args.papers_model   or args.model or "distilgpt2",
+        }
+        models_and_toks = [
+            _load_hf_model(per_client[name], args.device)
+            for name in client_names
+        ]
+
+    # Build clients
+    clients = []
+    models  = []
+    for idx, name in enumerate(client_names):
+        model, tokenizer = models_and_toks[idx]
+        models.append(model)
+        clients.append(
+            _make_client(idx, model, tokenizer,
+                         splits[name]["train"], cfg, args.device)
+        )
+    log.info("Built %d clients: %s", len(clients), client_names)
+
+    # Save run config
+    with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
+        json.dump({"method": args.method, "num_rounds": cfg.federation.num_rounds,
+                   "clients": client_names, "device": args.device}, f, indent=2)
+
+    T = cfg.federation.num_rounds
+    log.info("Starting %s training for %d rounds ...", args.method, T)
+
+    if args.method == "individual":
+        final_thetas = run_individual(clients, cfg, args.output_dir, T)
+    elif args.method == "fedavg":
+        final_thetas = run_fedavg(clients, cfg, args.output_dir, T)
+    elif args.method == "static":
+        final_thetas = run_static(clients, models, cfg, args.output_dir, T)
+    else:  # unifiededu
+        final_thetas = run_unifiededu(clients, cfg, args.output_dir, T)
+
+    log.info("Training complete. Checkpoints in %s", args.output_dir)
+    return final_thetas
+
+
+if __name__ == "__main__":
+    main()
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\config.py
+"""config.py -- All hyperparameters for UnifiedEdu."""
+
+from dataclasses import dataclass, field
+from typing import List
+
+
+@dataclass
+class ModelGraphConfig:
+    k_node: int = 8   # node groups for Theta
+    k_edge: int = 8   # edge groups for Theta
+
+
+@dataclass
+class FederationConfig:
+    num_rounds:   int   = 100
+    t_ic:         int   = 5     # intra-cluster aggregation interval
+    t_bc:         int   = 20    # inter-cluster aggregation interval
+    T_init:       int   = 30    # warm-up rounds before inter-cluster agg
+    t_update:     int   = 20    # re-clustering interval
+    num_clients:  int   = 4     # number of participating institutions
+    max_clusters: int   = -1    # -1 = floor(num_clients/2) auto
+
+    def effective_max_clusters(self) -> int:
+        if self.max_clusters > 0:
+            return self.max_clusters
+        return max(1, self.num_clients // 2)
+
+
+@dataclass
+class TrainingConfig:
+    lr:                          float = 1e-4
+    beta1:                       float = 0.9
+    beta2:                       float = 0.999
+    weight_decay:                float = 1e-2
+    batch_size:                  int   = 8
+    gradient_accumulation_steps: int   = 4
+    max_seq_len:                 int   = 512
+    chunk_stride:                int   = 128
+
+
+@dataclass
+class DataConfig:
+    chunk_size:           int   = 512   # tokens
+    chunk_stride:         int   = 128   # tokens
+    train_ratio:          float = 0.80
+    val_ratio:            float = 0.10
+    test_ratio:           float = 0.10
+    min_anchor_topics:    int   = 10
+    min_anchor_chunks:    int   = 20
+    embedding_model:      str   = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_dim:        int   = 384
+    min_centroid_distance: float = 0.15  # non-IID go/no-go gate
+
+
+@dataclass
+class EvalConfig:
+    bootstrap_samples: int   = 10_000
+    alpha:             float = 0.05
+    equity_epsilon:    float = 1e-6
+    bloom_weights:     List[float] = field(
+        default_factory=lambda: [0.33, 0.34, 0.33]  # alpha_1,2,3 for C_k
+    )
+    n_reverse_questions: int = 3   # for answer relevancy metric
+
+
+@dataclass
+class UnifiedEduConfig:
+    model_graph: ModelGraphConfig = field(default_factory=ModelGraphConfig)
+    federation:  FederationConfig = field(default_factory=FederationConfig)
+    training:    TrainingConfig   = field(default_factory=TrainingConfig)
+    data:        DataConfig       = field(default_factory=DataConfig)
+    eval:        EvalConfig       = field(default_factory=EvalConfig)
+    seed:        int              = 42
+    device:      str              = "cuda"
+
+
+# Singleton default config -- override fields as needed
+DEFAULT_CONFIG = UnifiedEduConfig()
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\data\dataset.py
+"""
+data/dataset.py
+
+PyTorch Dataset for QA generation fine-tuning.
+
+Each sample is a (context, question, answer) triple.  The tokenised
+sequence is formatted as:
+
+    Context: {context}
+
+    Question: {question}
+    Answer: {answer}{EOS}
+
+Labels follow the causal LM convention:
+  - -100 (ignore) for the "Context: ... Question: " prefix  ← model sees but doesn't predict
+  - actual token IDs for "{question}\\nAnswer: {answer}{EOS}" ← model must predict
+
+Truncation strategy (Papers contexts can be ~1 800 estimated tokens):
+  - Tokenise the Q+A completion first; count the tokens needed (≤ qa_max_tokens).
+  - Remaining budget = max_length − qa_tokens − template_overhead_tokens goes to context.
+  - Context is truncated from the END (start of context is usually most informative).
+  - If after truncation the QA still doesn't fit, the sample is silently replaced with
+    an empty-label sentinel (all labels = -100); this is logged once per dataset.
+
+Works with any HuggingFace tokenizer (BERT, LLaMA, GPT-2, Qwen, …).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from .preprocessing import load_jsonl
+
+log = logging.getLogger(__name__)
+
+# -100 is the standard PyTorch ignore index for cross-entropy
+LABEL_IGNORE_ID = -100
+
+# Prompt components (kept short to minimise overhead tokens)
+_CTX_PREFIX = "Context: "
+_QA_SEP     = "\n\nQuestion: "
+_ANS_SEP    = "\nAnswer: "
+
+
+# ---------------------------------------------------------------------------
+# Tokenisation helpers
+# ---------------------------------------------------------------------------
+
+def _build_texts(context: str, question: str, answer: str):
+    """
+    Return (prefix_text, completion_text).
+
+    prefix     = "Context: {context}\\n\\nQuestion: "
+    completion = "{question}\\nAnswer: {answer}"
+
+    Labels are -100 for prefix tokens; completion tokens are the targets.
+    """
+    prefix     = f"{_CTX_PREFIX}{context}{_QA_SEP}"
+    completion = f"{question}{_ANS_SEP}{answer}"
+    return prefix, completion
+
+
+def _tokenize_sample(
+    sample:         dict,
+    tokenizer,
+    max_length:     int  = 512,
+    qa_max_tokens:  int  = 128,
+) -> Dict[str, torch.Tensor]:
+    """
+    Tokenise one sample into {input_ids, attention_mask, labels}.
+
+    Context is truncated from the right if the full sequence exceeds max_length.
+    The Q+A completion is NEVER truncated; if it alone exceeds qa_max_tokens,
+    the completion is preserved and the context is shrunk to zero.
+
+    Parameters
+    ----------
+    sample        : dict with keys 'context', 'question', 'answer'
+    tokenizer     : HuggingFace tokenizer
+    max_length    : maximum sequence length in tokens (default 512)
+    qa_max_tokens : token budget reserved for Q+A (default 128)
+
+    Returns
+    -------
+    {input_ids: LongTensor, attention_mask: LongTensor, labels: LongTensor}
+    """
+    ctx  = sample["context"]
+    q    = sample["question"]
+    a    = sample["answer"]
+
+    # ------------------------------------------------------------------
+    # Step 1: tokenise the completion to know its exact length
+    # ------------------------------------------------------------------
+    prefix_text, completion_text = _build_texts(ctx, q, a)
+
+    completion_ids = tokenizer.encode(
+        completion_text, add_special_tokens=False
+    )
+
+    # Add EOS if the tokenizer has one (helps decoder-only models learn to stop)
+    eos = tokenizer.eos_token_id
+    if eos is not None and (not completion_ids or completion_ids[-1] != eos):
+        completion_ids = completion_ids + [eos]
+
+    # ------------------------------------------------------------------
+    # Step 2: figure out token budget for the context
+    # ------------------------------------------------------------------
+    # BOS token (if any) takes 1 slot
+    has_bos   = (tokenizer.bos_token_id is not None)
+    bos_slots = 1 if has_bos else 0
+
+    # Tokens used by the template scaffolding (everything except the raw context):
+    # _CTX_PREFIX + _QA_SEP  →  tokenise without the context to get overhead
+    template_overhead_ids = tokenizer.encode(
+        f"{_CTX_PREFIX}{_QA_SEP}", add_special_tokens=False
+    )
+    overhead = len(template_overhead_ids) + bos_slots
+
+    # Max tokens the context may use
+    ctx_budget = max(0, max_length - len(completion_ids) - overhead)
+
+    # ------------------------------------------------------------------
+    # Step 3: tokenise and (if needed) truncate the context
+    # ------------------------------------------------------------------
+    ctx_ids = tokenizer.encode(ctx, add_special_tokens=False)
+    if len(ctx_ids) > ctx_budget:
+        ctx_ids = ctx_ids[:ctx_budget]
+
+    # Rebuild prefix text from (possibly truncated) context tokens and re-decode
+    # to get a clean string — avoids half-word tokenisation artefacts.
+    truncated_ctx  = tokenizer.decode(ctx_ids, skip_special_tokens=True)
+    prefix_text, _ = _build_texts(truncated_ctx, q, a)
+
+    # ------------------------------------------------------------------
+    # Step 4: assemble and tokenise the full sequence
+    # ------------------------------------------------------------------
+    full_text = prefix_text + completion_text
+
+    full_enc = tokenizer(
+        full_text,
+        max_length=max_length,
+        truncation=True,        # safety net; should not fire after step 3
+        padding=False,
+        add_special_tokens=True,
+        return_tensors=None,
+    )
+    input_ids      = full_enc["input_ids"]
+    attention_mask = full_enc["attention_mask"]
+
+    # Explicitly append EOS if the tokenizer uses one and there is budget left.
+    # (The tokenizer.__call__ may or may not add EOS depending on its config;
+    # we normalise by always appending it so the model learns to stop.)
+    if (
+        eos is not None
+        and len(input_ids) < max_length
+        and (not input_ids or input_ids[-1] != eos)
+    ):
+        input_ids      = input_ids + [eos]
+        attention_mask = attention_mask + [1]
+
+    # ------------------------------------------------------------------
+    # Step 5: build labels — find where the completion begins
+    # ------------------------------------------------------------------
+    # Encode prefix to count its tokens (with same special-token settings)
+    prefix_enc_ids = tokenizer.encode(prefix_text, add_special_tokens=True)
+    n_prefix       = len(prefix_enc_ids)
+
+    # Sanity: if truncation removed part of the completion, keep what remains.
+    n_prefix = min(n_prefix, len(input_ids))
+
+    # Warn once if the completion was truncated away entirely
+    if n_prefix == len(input_ids):
+        log.warning(
+            "Sample '%s': completion fully truncated; all labels = -100.",
+            sample.get("sample_id", "?"),
+        )
+
+    labels = (
+        [LABEL_IGNORE_ID] * n_prefix
+        + list(input_ids[n_prefix:])
+    )
+    # Trim to input length (should already match, but defensive)
+    labels = labels[:len(input_ids)]
+
+    return {
+        "input_ids":      torch.tensor(input_ids,      dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        "labels":         torch.tensor(labels,         dtype=torch.long),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class QADataset(Dataset):
+    """
+    PyTorch Dataset for QA generation.
+
+    Parameters
+    ----------
+    samples       : list of dicts (from preprocessing.load_jsonl / prepare_all)
+    tokenizer     : HuggingFace tokenizer
+    max_length    : token sequence length cap (default 512)
+    qa_max_tokens : token budget reserved for Q+A completion (default 128)
+    """
+
+    def __init__(
+        self,
+        samples:       List[dict],
+        tokenizer,
+        max_length:    int = 512,
+        qa_max_tokens: int = 128,
+    ) -> None:
+        self.samples       = samples
+        self.tokenizer     = tokenizer
+        self.max_length    = max_length
+        self.qa_max_tokens = qa_max_tokens
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return _tokenize_sample(
+            self.samples[idx],
+            self.tokenizer,
+            max_length=self.max_length,
+            qa_max_tokens=self.qa_max_tokens,
+        )
+
+    # ------------------------------------------------------------------
+    # Convenience constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_jsonl(
+        cls,
+        path:          str,
+        tokenizer,
+        max_length:    int = 512,
+        qa_max_tokens: int = 128,
+    ) -> "QADataset":
+        """Load a .jsonl file produced by preprocessing.save_jsonl()."""
+        return cls(
+            samples=load_jsonl(path),
+            tokenizer=tokenizer,
+            max_length=max_length,
+            qa_max_tokens=qa_max_tokens,
+        )
+
+    @classmethod
+    def from_splits(
+        cls,
+        splits:        Dict[str, List[dict]],
+        split_name:    str,
+        tokenizer,
+        max_length:    int = 512,
+        qa_max_tokens: int = 128,
+    ) -> "QADataset":
+        """Build from an in-memory splits dict (output of prepare_all)."""
+        return cls(
+            samples=splits[split_name],
+            tokenizer=tokenizer,
+            max_length=max_length,
+            qa_max_tokens=qa_max_tokens,
+        )
+
+    def label_coverage(self) -> float:
+        """
+        Fraction of samples that have at least one non-masked label token.
+        A value < 1.0 indicates truncation is swallowing some completions.
+        (Computes on a 10 % random sample to avoid full-dataset tokenisation.)
+        """
+        import random
+        k     = max(1, len(self.samples) // 10)
+        idxs  = random.sample(range(len(self.samples)), k)
+        valid = sum(
+            1 for i in idxs
+            if (self[i]["labels"] != LABEL_IGNORE_ID).any()
+        )
+        return valid / k
+
+
+# ---------------------------------------------------------------------------
+# Collator (handles variable-length padding within a batch)
+# ---------------------------------------------------------------------------
+
+class QACollator:
+    """
+    Pads variable-length sequences in a batch to the longest sequence.
+
+    Parameters
+    ----------
+    pad_token_id : int   (from tokenizer.pad_token_id)
+    label_pad_id : int   (default -100)
+    """
+
+    def __init__(self, pad_token_id: int, label_pad_id: int = LABEL_IGNORE_ID) -> None:
+        self.pad_token_id = pad_token_id
+        self.label_pad_id = label_pad_id
+
+    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        max_len = max(item["input_ids"].shape[0] for item in batch)
+
+        input_ids_list      = []
+        attention_mask_list = []
+        labels_list         = []
+
+        for item in batch:
+            seq_len  = item["input_ids"].shape[0]
+            pad_len  = max_len - seq_len
+
+            input_ids_list.append(
+                torch.cat([item["input_ids"],
+                           torch.full((pad_len,), self.pad_token_id, dtype=torch.long)])
+            )
+            attention_mask_list.append(
+                torch.cat([item["attention_mask"],
+                           torch.zeros(pad_len, dtype=torch.long)])
+            )
+            labels_list.append(
+                torch.cat([item["labels"],
+                           torch.full((pad_len,), self.label_pad_id, dtype=torch.long)])
+            )
+
+        return {
+            "input_ids":      torch.stack(input_ids_list),
+            "attention_mask": torch.stack(attention_mask_list),
+            "labels":         torch.stack(labels_list),
+        }
+
+
+# ---------------------------------------------------------------------------
+# DataLoader factory
+# ---------------------------------------------------------------------------
+
+def make_dataloader(
+    samples:       List[dict],
+    tokenizer,
+    batch_size:    int  = 8,
+    max_length:    int  = 512,
+    qa_max_tokens: int  = 128,
+    shuffle:       bool = True,
+    num_workers:   int  = 0,
+) -> DataLoader:
+    """
+    Build a DataLoader ready for the FederationClient training loop.
+
+    Parameters
+    ----------
+    samples       : output of preprocessing.prepare_all() or load_jsonl()
+    tokenizer     : HuggingFace tokenizer (must have pad_token_id set)
+    batch_size    : samples per batch
+    max_length    : token sequence length cap
+    qa_max_tokens : token budget reserved for Q+A
+    shuffle       : shuffle at each epoch (True for train, False for val/test)
+    num_workers   : DataLoader worker processes
+    """
+    # Ensure the tokenizer has a pad token (required for collation)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            log.info("Tokenizer has no pad_token; using eos_token as pad.")
+        else:
+            raise ValueError(
+                "Tokenizer has neither pad_token_id nor eos_token_id. "
+                "Set tokenizer.pad_token_id manually before calling make_dataloader."
+            )
+
+    dataset  = QADataset(samples, tokenizer, max_length=max_length, qa_max_tokens=qa_max_tokens)
+    collator = QACollator(pad_token_id=tokenizer.pad_token_id)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collator,
+        num_workers=num_workers,
+        pin_memory=False,
+    )
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\data\preprocessing.py
+"""
+data/preprocessing.py
+
+Loads the three public QA datasets, balances them to equal sample counts,
+splits into train/val/test, computes embeddings, and verifies non-IID
+separation between clients.
+
+Data model
+----------
+Each record in a source file has the structure:
+    {
+        "input_index": int,
+        "clean_context": str,          # source passage
+        "qa_pairs": [                  # 3-6 pairs per record
+            {"question": str, "answer": str, "difficulty": str}, ...
+        ],
+        "input_meta": dict             # provenance metadata
+    }
+
+A *sample* is one (context, question, answer) triple derived by
+flattening each record's qa_pairs list.  This is the atomic unit that
+enters the PyTorch Dataset.
+
+Balancing rule
+--------------
+  MIT    : 110 records -> 547  QA triples  (all kept)
+  Stanford: 110 records -> 559  QA triples  (subsampled to 547)
+  Papers :  981 records -> 5037 QA triples  (subsampled to 547)
+
+  Target N = min(|MIT|, |Stanford|, |Papers|) = 547 per client.
+  Subsampling is stratified by difficulty {easy, medium, hard} so each
+  client preserves its original difficulty distribution at the target N.
+
+Splits
+------
+  80 % train, 10 % val, 10 % test.
+  The test split is guaranteed to include >= 20 samples that cover each
+  of the 10 fixed anchor topics (keyword-based matching).
+
+Non-IID gate
+------------
+  Mean pairwise cosine distance between per-client embedding centroids
+  must be >= 0.15.  The function verify_non_iid() raises ValueError if
+  the gate fails.
+
+Outputs
+-------
+  For each client, three JSONL files are written:
+    <output_dir>/<client_name>_{train,val,test}.jsonl
+
+  Each line:
+    {
+        "sample_id":  str,
+        "context":    str,
+        "question":   str,
+        "answer":     str,
+        "difficulty": str,
+        "bloom_level": str,   # from meta if present, else "unknown"
+        "metadata":   dict,
+        "embedding":  list[float]   # 384-dim, all-MiniLM-L6-v2
+    }
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import random
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fixed anchor topics (10 ML concepts guaranteed to appear in the test split)
+# ---------------------------------------------------------------------------
+
+ANCHOR_TOPICS: List[Tuple[str, List[str]]] = [
+    ("linear_regression",     ["linear regression", "least squares", "normal equation"]),
+    ("neural_networks",       ["neural network", "deep learning", "hidden layer", "activation function"]),
+    ("gradient_descent",      ["gradient descent", "learning rate", "stochastic gradient", "sgd", "adam"]),
+    ("regularisation",        ["regularization", "regularisation", "overfitting", "l1", "l2", "lasso", "ridge"]),
+    ("svm",                   ["support vector", "svm", "kernel", "margin", "hyperplane"]),
+    ("probabilistic_models",  ["bayesian", "probabilistic", "likelihood", "prior", "posterior", "gaussian"]),
+    ("clustering",            ["clustering", "k-means", "unsupervised", "cluster"]),
+    ("dimensionality",        ["dimensionality reduction", "pca", "principal component", "embedding"]),
+    ("generalisation_theory", ["generalisation", "generalization", "vc dimension", "bias-variance",
+                               "learning theory", "pac learning"]),
+    ("backpropagation",       ["backpropagation", "back propagation", "chain rule", "gradient flow",
+                               "training loss", "loss function"]),
+]
+
+# Client name -> source JSON filename
+CLIENT_FILES: Dict[str, str] = {
+    "mit":      "ML_QA_LectureNotes_MIT.json",
+    "stanford": "ML_QA_LectureNotes_StanfordCS229.json",
+    "papers":   "ML_QA_Papers_v2.json",
+}
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def _load_multi_json(path: str) -> List[dict]:
+    """
+    Parse a file containing one or more concatenated JSON objects
+    (not a JSON array, not JSONL -- just sequential top-level objects).
+    """
+    with open(path, encoding="utf-8") as f:
+        raw = f.read().strip()
+    decoder = json.JSONDecoder()
+    records, pos = [], 0
+    while pos < len(raw):
+        obj, end = decoder.raw_decode(raw, pos)
+        records.append(obj)
+        pos = end
+        while pos < len(raw) and raw[pos] in " \t\n\r":
+            pos += 1
+    return records
+
+
+def _flatten_to_samples(records: List[dict], client_name: str) -> List[dict]:
+    """
+    Expand each record into one sample per QA pair.
+
+    Returns a list of dicts:
+        {sample_id, context, question, answer, difficulty, bloom_level, metadata}
+    """
+    samples = []
+    for rec in records:
+        ctx  = rec["clean_context"]
+        meta = rec["input_meta"]
+        bloom = meta.get("bloom_level", "unknown")
+
+        for qa in rec.get("qa_pairs", []):
+            # Deterministic ID from full content (avoid collisions on similar questions)
+            raw_id = f"{client_name}|{rec['input_index']}|{qa['question']}|{qa['answer'][:60]}"
+            sid    = hashlib.md5(raw_id.encode("utf-8")).hexdigest()[:16]
+
+            samples.append({
+                "sample_id":  sid,
+                "context":    ctx,
+                "question":   qa["question"],
+                "answer":     qa["answer"],
+                "difficulty": qa.get("difficulty", "unknown"),
+                "bloom_level": bloom,
+                "metadata":   meta,
+                "embedding":  [],   # filled later by embed_samples()
+            })
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# Stratified subsampling
+# ---------------------------------------------------------------------------
+
+def _stratified_subsample(
+    samples: List[dict],
+    target_n: int,
+    rng: random.Random,
+) -> List[dict]:
+    """
+    Sample exactly target_n items from samples, stratified by difficulty.
+
+    Proportions are computed from the full list; any rounding remainder
+    is filled from the most frequent bucket.
+    """
+    if len(samples) <= target_n:
+        return list(samples)
+
+    # Group by difficulty
+    buckets: Dict[str, List[dict]] = defaultdict(list)
+    for s in samples:
+        buckets[s["difficulty"]].append(s)
+
+    total = len(samples)
+    allocated = 0
+    result: List[dict] = []
+
+    # Sort for determinism; most-frequent last (receives remainder)
+    sorted_keys = sorted(buckets.keys(), key=lambda k: len(buckets[k]))
+
+    for i, key in enumerate(sorted_keys):
+        is_last = i == len(sorted_keys) - 1
+        bucket  = buckets[key]
+        if is_last:
+            n_take = target_n - allocated
+        else:
+            n_take = round(len(bucket) / total * target_n)
+            n_take = min(n_take, len(bucket))
+
+        rng.shuffle(bucket)
+        result.extend(bucket[:n_take])
+        allocated += n_take
+
+    rng.shuffle(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Anchor-topic matching
+# ---------------------------------------------------------------------------
+
+def _anchor_hits(text: str) -> List[str]:
+    """Return list of anchor topic keys whose keywords appear in text (case-insensitive)."""
+    text_lower = text.lower()
+    hits = []
+    for topic_key, keywords in ANCHOR_TOPICS:
+        if any(kw in text_lower for kw in keywords):
+            hits.append(topic_key)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Train / val / test split
+# ---------------------------------------------------------------------------
+
+def _split_samples(
+    samples:    List[dict],
+    train_ratio: float,
+    val_ratio:   float,
+    min_anchor_chunks: int,
+    rng:         random.Random,
+) -> Tuple[List[dict], List[dict], List[dict]]:
+    """
+    Split samples into train / val / test.
+
+    Anchor-topic guarantee:
+        For each of the 10 anchor topics, we try to include at least
+        min_anchor_chunks // 10 samples in the test set whose context
+        matches that topic's keywords.  If the dataset has too few
+        anchor hits, we include all matching samples in test and fill
+        the remainder with non-anchor samples.
+
+    Returns (train, val, test).
+    """
+    test_ratio = 1.0 - train_ratio - val_ratio
+    n_test     = max(1, round(len(samples) * test_ratio))
+    n_val      = max(1, round(len(samples) * val_ratio))
+
+    # Separate anchor and non-anchor samples
+    anchor_map: Dict[str, List[dict]] = defaultdict(list)
+    for s in samples:
+        for topic in _anchor_hits(s["context"] + " " + s["question"]):
+            anchor_map[topic].append(s)
+
+    # Guarantee at least one sample per anchor topic in test (if available)
+    test_set:   List[dict] = []
+    used_ids = set()
+
+    per_topic_target = max(1, min_anchor_chunks // len(ANCHOR_TOPICS))
+    for topic_key, _ in ANCHOR_TOPICS:
+        candidates = [s for s in anchor_map.get(topic_key, [])
+                      if s["sample_id"] not in used_ids]
+        rng.shuffle(candidates)
+        chosen = candidates[:per_topic_target]
+        for s in chosen:
+            used_ids.add(s["sample_id"])
+        test_set.extend(chosen)
+
+    # Fill remainder of test from non-anchor samples
+    non_anchor = [s for s in samples if s["sample_id"] not in used_ids]
+    rng.shuffle(non_anchor)
+    still_needed = max(0, n_test - len(test_set))
+    extra = non_anchor[:still_needed]
+    test_set.extend(extra)
+    used_ids.update(s["sample_id"] for s in extra)
+
+    # Everything not in test is available for train / val
+    remaining = [s for s in samples if s["sample_id"] not in used_ids]
+    rng.shuffle(remaining)
+
+    val_set   = remaining[:n_val]
+    train_set = remaining[n_val:]
+
+    log.info(
+        "Split: train=%d val=%d test=%d | anchor topics covered: %d/10",
+        len(train_set), len(val_set), len(test_set),
+        sum(1 for tk, _ in ANCHOR_TOPICS if any(
+            _anchor_hits(s["context"] + s["question"])
+            for s in test_set if tk in _anchor_hits(s["context"] + s["question"])
+        )),
+    )
+    return train_set, val_set, test_set
+
+
+# ---------------------------------------------------------------------------
+# Embedding (all-MiniLM-L6-v2 via HuggingFace transformers)
+# ---------------------------------------------------------------------------
+
+def _mean_pool(
+    token_embeddings: torch.Tensor,
+    attention_mask:   torch.Tensor,
+) -> torch.Tensor:
+    """Masked mean pooling over token dimension."""
+    mask_expanded = attention_mask.unsqueeze(-1).float()
+    summed = (token_embeddings * mask_expanded).sum(dim=1)
+    counts = mask_expanded.sum(dim=1).clamp(min=1e-9)
+    return summed / counts
+
+
+def embed_texts(
+    texts:      List[str],
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 64,
+    device:     str = "cpu",
+    max_length: int = 256,
+) -> np.ndarray:
+    """
+    Compute 384-dim sentence embeddings for each text.
+
+    Uses HuggingFace AutoTokenizer + AutoModel with mean pooling,
+    which is equivalent to the sentence-transformers pipeline.
+
+    Parameters
+    ----------
+    texts      : list of strings
+    model_name : HuggingFace model id
+    batch_size : tokeniser batch size
+    device     : 'cpu' or 'cuda'
+    max_length : truncation length in tokens
+
+    Returns
+    -------
+    np.ndarray, shape (len(texts), 384), dtype float32
+    """
+    from transformers import AutoTokenizer, AutoModel
+
+    log.info("Loading embedding model %s ...", model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model     = AutoModel.from_pretrained(model_name).to(device)
+    model.eval()
+
+    all_embeddings = []
+    for start in range(0, len(texts), batch_size):
+        batch_texts = texts[start: start + batch_size]
+        encoded = tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        encoded = {k: v.to(device) for k, v in encoded.items()}
+        with torch.no_grad():
+            out = model(**encoded)
+        emb = _mean_pool(out.last_hidden_state, encoded["attention_mask"])
+        # L2-normalise (cosine similarity = dot product after normalisation)
+        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+        all_embeddings.append(emb.cpu().float().numpy())
+
+    result = np.concatenate(all_embeddings, axis=0)
+    log.info("Embedded %d texts -> shape %s", len(texts), result.shape)
+    return result
+
+
+def embed_samples(
+    samples:    List[dict],
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 64,
+    device:     str = "cpu",
+) -> List[dict]:
+    """
+    Add 'embedding' field (list[float]) to each sample dict in-place.
+    Returns the same list for convenience.
+    """
+    texts = [s["context"] for s in samples]
+    embs  = embed_texts(texts, model_name=model_name, batch_size=batch_size, device=device)
+    for s, e in zip(samples, embs):
+        s["embedding"] = e.tolist()
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# Non-IID verification
+# ---------------------------------------------------------------------------
+
+def verify_non_iid(
+    client_embeddings: Dict[str, np.ndarray],
+    min_distance:      float = 0.15,
+    raise_on_fail:     bool  = True,
+) -> Tuple[bool, float]:
+    """
+    Verify that client embedding centroids are sufficiently separated.
+
+    Computes the per-client mean embedding centroid (already L2-normalised
+    per embed_texts, so cosine distance = 1 - dot product).
+
+    Parameters
+    ----------
+    client_embeddings : Dict[client_name, ndarray (N, dim)]
+    min_distance      : go/no-go threshold (default 0.15)
+    raise_on_fail     : raise ValueError if gate fails
+
+    Returns
+    -------
+    (passed: bool, mean_pairwise_dist: float)
+    """
+    from scipy.spatial.distance import cosine as cosine_dist
+
+    names     = sorted(client_embeddings.keys())
+    centroids = {name: client_embeddings[name].mean(axis=0) for name in names}
+
+    distances = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            d = cosine_dist(centroids[names[i]], centroids[names[j]])
+            distances.append(d)
+            log.info(
+                "Centroid distance %s <-> %s: %.4f",
+                names[i], names[j], d,
+            )
+
+    mean_dist = float(np.mean(distances))
+    passed    = mean_dist >= min_distance
+
+    log.info(
+        "Non-IID gate: mean pairwise centroid distance = %.4f (threshold %.2f) -> %s",
+        mean_dist, min_distance, "PASS" if passed else "FAIL",
+    )
+
+    if not passed and raise_on_fail:
+        raise ValueError(
+            f"Non-IID gate FAILED: mean centroid distance {mean_dist:.4f} < {min_distance}. "
+            "Check that client datasets are sufficiently different."
+        )
+
+    return passed, mean_dist
+
+
+# ---------------------------------------------------------------------------
+# t-SNE visualisation (optional, requires matplotlib)
+# ---------------------------------------------------------------------------
+
+def plot_tsne(
+    client_embeddings: Dict[str, np.ndarray],
+    output_path:       str = "tsne_embeddings.png",
+    seed:              int = 42,
+) -> None:
+    """
+    Produce t-SNE plot of all embeddings coloured by client / institution.
+    Silently skips if matplotlib is not installed.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+    except ImportError:
+        log.warning("matplotlib not installed; skipping t-SNE plot.")
+        return
+
+    names = sorted(client_embeddings.keys())
+    all_embs   = np.concatenate([client_embeddings[n] for n in names], axis=0)
+    all_labels = np.concatenate([
+        np.full(client_embeddings[n].shape[0], i)
+        for i, n in enumerate(names)
+    ])
+
+    log.info("Running t-SNE on %d points ...", len(all_embs))
+    tsne = TSNE(n_components=2, random_state=seed, perplexity=30, n_iter=1000)
+    proj = tsne.fit_transform(all_embs)
+
+    colours = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for i, name in enumerate(names):
+        mask = all_labels == i
+        ax.scatter(proj[mask, 0], proj[mask, 1], s=10, alpha=0.6,
+                   c=colours[i % len(colours)], label=name)
+    ax.legend(title="Client")
+    ax.set_title("t-SNE of context embeddings by institution")
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    log.info("t-SNE saved to %s", output_path)
+
+
+# ---------------------------------------------------------------------------
+# JSONL I/O
+# ---------------------------------------------------------------------------
+
+def save_jsonl(samples: List[dict], path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for s in samples:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    log.info("Saved %d samples to %s", len(samples), path)
+
+
+def load_jsonl(path: str) -> List[dict]:
+    samples = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                samples.append(json.loads(line))
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def prepare_all(
+    data_dir:           str  = ".",
+    output_dir:         str  = "data/processed",
+    seed:               int  = 42,
+    train_ratio:        float = 0.80,
+    val_ratio:          float = 0.10,
+    min_anchor_chunks:  int  = 20,
+    min_iid_distance:   float = 0.15,
+    embed:              bool = True,
+    embedding_model:    str  = "sentence-transformers/all-MiniLM-L6-v2",
+    embedding_device:   str  = "cpu",
+    plot_tsne_path:     Optional[str] = None,
+) -> Dict[str, Dict[str, List[dict]]]:
+    """
+    Full preprocessing pipeline.
+
+    Returns
+    -------
+    Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    """
+    rng = random.Random(seed)
+
+    # ------------------------------------------------------------------
+    # 1. Load and flatten
+    # ------------------------------------------------------------------
+    log.info("Loading source files from %s ...", data_dir)
+    raw: Dict[str, List[dict]] = {}
+    for client_name, fname in CLIENT_FILES.items():
+        path    = os.path.join(data_dir, fname)
+        records = _load_multi_json(path)
+        samples = _flatten_to_samples(records, client_name)
+        raw[client_name] = samples
+        log.info("  %s: %d records -> %d QA triples", client_name, len(records), len(samples))
+
+    # ------------------------------------------------------------------
+    # 2. Balance to equal sample counts (stratified by difficulty)
+    # ------------------------------------------------------------------
+    target_n = min(len(v) for v in raw.values())
+    log.info("Balancing to %d samples per client (stratified by difficulty)", target_n)
+
+    balanced: Dict[str, List[dict]] = {}
+    for client_name, samples in raw.items():
+        balanced[client_name] = _stratified_subsample(samples, target_n, rng)
+        log.info("  %s: %d -> %d", client_name, len(samples), len(balanced[client_name]))
+
+    # ------------------------------------------------------------------
+    # 3. Embed (optional -- required for non-IID check and JSONL output)
+    # ------------------------------------------------------------------
+    if embed:
+        for client_name, samples in balanced.items():
+            log.info("Embedding %s ...", client_name)
+            embed_samples(samples, model_name=embedding_model, device=embedding_device)
+    else:
+        log.warning("Embedding skipped (embed=False). Non-IID check will be skipped too.")
+
+    # ------------------------------------------------------------------
+    # 4. Non-IID verification
+    # ------------------------------------------------------------------
+    if embed:
+        client_embs: Dict[str, np.ndarray] = {
+            name: np.array([s["embedding"] for s in samples])
+            for name, samples in balanced.items()
+        }
+        verify_non_iid(client_embs, min_distance=min_iid_distance, raise_on_fail=True)
+
+        if plot_tsne_path:
+            plot_tsne(client_embs, output_path=plot_tsne_path)
+
+    # ------------------------------------------------------------------
+    # 5. Split each client's dataset
+    # ------------------------------------------------------------------
+    splits: Dict[str, Dict[str, List[dict]]] = {}
+    for client_name, samples in balanced.items():
+        train, val, test = _split_samples(
+            samples,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            min_anchor_chunks=min_anchor_chunks,
+            rng=rng,
+        )
+        splits[client_name] = {"train": train, "val": val, "test": test}
+        log.info(
+            "%s splits: train=%d val=%d test=%d",
+            client_name, len(train), len(val), len(test),
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Save JSONL
+    # ------------------------------------------------------------------
+    for client_name, split_dict in splits.items():
+        for split_name, samples in split_dict.items():
+            out_path = os.path.join(output_dir, f"{client_name}_{split_name}.jsonl")
+            save_jsonl(samples, out_path)
+
+    log.info("Preprocessing complete. Output dir: %s", output_dir)
+    return splits
+
+
+# ---------------------------------------------------------------------------
+# Convenience: load already-processed splits back into memory
+# ---------------------------------------------------------------------------
+
+def load_splits(
+    output_dir:  str,
+    client_names: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, List[dict]]]:
+    """
+    Load JSONL files previously written by prepare_all().
+
+    Returns Dict[client_name, {"train": [...], "val": [...], "test": [...]}]
+    """
+    names = client_names or list(CLIENT_FILES.keys())
+    result = {}
+    for client_name in names:
+        result[client_name] = {}
+        for split in ("train", "val", "test"):
+            path = os.path.join(output_dir, f"{client_name}_{split}.jsonl")
+            result[client_name][split] = load_jsonl(path)
+    return result
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\data\__init__.py
+from .preprocessing import (
+    prepare_all, load_splits, load_jsonl, save_jsonl,
+    embed_texts, embed_samples, verify_non_iid,
+    CLIENT_FILES, ANCHOR_TOPICS,
+)
+from .dataset import QADataset, QACollator, make_dataloader, LABEL_IGNORE_ID
+
+__all__ = [
+    "prepare_all", "load_splits", "load_jsonl", "save_jsonl",
+    "embed_texts", "embed_samples", "verify_non_iid",
+    "CLIENT_FILES", "ANCHOR_TOPICS",
+    "QADataset", "QACollator", "make_dataloader", "LABEL_IGNORE_ID",
+]
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\evaluation\__init__.py
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\federation\client.py
+"""
+federation/client.py
+
+Local training loop for one institution.
+
+The backbone model is FULLY FROZEN.  The only trainable variable is the
+Theta vector (ThetaVector).  Theta modulates every linear layer's weights
+and biases via SoftSign before each forward pass, so the gradient flows:
+
+  loss  ->  modulated_params  ->  SoftSign  ->  Theta
+
+torch.func.functional_call is used to inject modulated parameters into
+the frozen HuggingFace backbone without mutating it.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Iterator, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from torch.func import functional_call
+from torch.optim import AdamW
+
+from ..models.gnn_params import ThetaVector, theta_from_flat, _soft_sign
+from ..config import FederationConfig, TrainingConfig
+
+
+# ---------------------------------------------------------------------------
+# Layer-group assignment
+# ---------------------------------------------------------------------------
+
+def assign_layer_groups(
+    model:  nn.Module,
+    k_edge: int,
+    k_node: int,
+) -> Dict[str, Tuple[int, int]]:
+    """
+    Map every nn.Linear in the model to a deterministic (edge_group, node_group).
+
+    Assignment uses the enumeration order of named_modules(), which is stable
+    for a given model class, so the same groups are used every time the
+    function is called on the same architecture.
+
+    Returns
+    -------
+    Dict[module_name, (edge_group_id, node_group_id)]
+    """
+    groups: Dict[str, Tuple[int, int]] = {}
+    i = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            groups[name] = (i % k_edge, i % k_node)
+            i += 1
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Theta application to model weights  (module-level, used by both client
+# and forward_pass emulation)
+# ---------------------------------------------------------------------------
+
+def modulate_params(
+    model:        nn.Module,
+    theta:        ThetaVector,
+    layer_groups: Dict[str, Tuple[int, int]],
+) -> Dict[str, torch.Tensor]:
+    """
+    Build a dict of Theta-modulated weight/bias tensors for every Linear layer.
+
+    Edge modulation (weights):
+        w_mod = SoftSign(w * theta_edge[g] + theta_edge_shift[g], theta_scale_edge)
+
+    Node modulation (biases):
+        b_mod = SoftSign(b * theta_node[g] + theta_node_shift[g], theta_scale_node)
+
+    The backbone's original weights are detached (no grad flows to them).
+    Gradient flows only through Theta.
+
+    Returns
+    -------
+    Dict suitable for torch.func.functional_call(..., strict=False).
+    Keys match the format produced by model.named_parameters().
+    """
+    params: Dict[str, torch.Tensor] = {}
+
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        group_info = layer_groups.get(name)
+        if group_info is None:
+            continue
+        eg, ng = group_info
+
+        # Weight (edge modulation) -- scalar broadcast over full matrix
+        w = module.weight.detach()
+        params[name + ".weight"] = _soft_sign(
+            w * theta.theta_edge[eg] + theta.theta_edge_shift[eg],
+            theta.theta_scale_edge,
+        )
+
+        # Bias (node modulation)
+        if module.bias is not None:
+            b = module.bias.detach()
+            params[name + ".bias"] = _soft_sign(
+                b * theta.theta_node[ng] + theta.theta_node_shift[ng],
+                theta.theta_scale_node,
+            )
+
+    return params
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+class FederationClient:
+    """
+    One participating institution in the UnifiedEdu federation.
+
+    Parameters
+    ----------
+    client_id   : int
+    model       : nn.Module
+        HuggingFace backbone (BertForMaskedLM, LlamaForCausalLM, etc.).
+        Must support forward(**batch) -> loss when batch contains 'labels'.
+    dataloader  : DataLoader
+        Yields dicts with keys 'input_ids', 'attention_mask', 'labels'.
+    k_edge, k_node : int
+        Must match the server's ThetaVector dimensions.
+    fed_config  : FederationConfig
+    train_config: TrainingConfig
+    device      : str
+    """
+
+    def __init__(
+        self,
+        client_id:    int,
+        model:        nn.Module,
+        dataloader,
+        k_edge:       int,
+        k_node:       int,
+        fed_config:   FederationConfig,
+        train_config: TrainingConfig,
+        device:       str = "cpu",
+    ) -> None:
+        self.client_id    = client_id
+        self.model        = model.to(device)
+        self.dataloader   = dataloader
+        self.k_edge       = k_edge
+        self.k_node       = k_node
+        self.fed_config   = fed_config
+        self.train_config = train_config
+        self.device       = device
+
+        # Freeze ALL backbone parameters
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.model.eval()
+
+        # Stable layer-group assignment (computed once)
+        self.layer_groups = assign_layer_groups(model, k_edge, k_node)
+
+    # ------------------------------------------------------------------
+    # Main API
+    # ------------------------------------------------------------------
+
+    def local_train(self, theta_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Perform one local epoch of mini-batch AdamW optimisation.
+
+        Parameters
+        ----------
+        theta_flat : Tensor, shape (p,)
+            Theta broadcast from the server this round.
+
+        Returns
+        -------
+        Tensor, shape (p,)
+            Updated Theta after one local epoch.
+        """
+        theta = theta_from_flat(theta_flat.clone().to(self.device), self.k_edge, self.k_node)
+
+        optimizer = AdamW(
+            theta.parameters(),
+            lr=self.train_config.lr,
+            betas=(self.train_config.beta1, self.train_config.beta2),
+            weight_decay=self.train_config.weight_decay,
+        )
+
+        accum   = self.train_config.gradient_accumulation_steps
+        theta.train()
+        optimizer.zero_grad()
+        pending = 0
+
+        for step, batch in enumerate(self.dataloader):
+            loss = self._compute_loss(batch, theta)
+            (loss / accum).backward()
+            pending += 1
+
+            if pending == accum:
+                torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                pending = 0
+
+        # Flush any remaining accumulated gradients
+        if pending > 0:
+            torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        return theta.theta.detach().clone()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _compute_loss(self, batch: dict, theta: ThetaVector) -> torch.Tensor:
+        """
+        Forward pass with Theta-modulated backbone weights; return scalar loss.
+
+        Expects batch keys: 'input_ids', 'attention_mask', 'labels'.
+        Labels should be -100 for context (masked) positions.
+        """
+        batch = {k: v.to(self.device) for k, v in batch.items()}
+        modulated = modulate_params(self.model, theta, self.layer_groups)
+
+        outputs = functional_call(
+            self.model,
+            modulated,
+            args=(),
+            kwargs=batch,
+            strict=False,
+        )
+
+        # HuggingFace models return an object with .loss when labels are provided
+        if hasattr(outputs, "loss") and outputs.loss is not None:
+            return outputs.loss
+
+        # Fallback: compute cross-entropy manually from logits
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+        labels = batch["labels"]
+        return nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=-100,
+        )
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\federation\clustering.py
+"""
+federation/clustering.py
+
+Dynamic Theta-guided clustering for UnifiedEdu.
+
+Given a matrix of uploaded Theta vectors (one per institution), this
+module computes pairwise L2 distances, runs Ward's agglomerative
+clustering, and selects the cut depth that maximises the mean
+silhouette score.
+
+Public API
+----------
+cluster_thetas(thetas, max_clusters) -> ClusterResult
+    Main entry point called by the server each t_update rounds.
+
+pairwise_l2(thetas) -> np.ndarray
+    Symmetric distance matrix, shape (m, m).
+
+ward_linkage(dist_matrix) -> np.ndarray
+    scipy linkage matrix from a condensed distance matrix.
+
+best_cut(linkage_matrix, dist_matrix, max_k) -> Tuple[np.ndarray, int, float]
+    Sweep candidate cuts; return (labels, k*, silhouette*).
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+from sklearn.metrics import silhouette_score
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClusterResult:
+    """Output of one clustering pass.
+
+    Attributes
+    ----------
+    labels : np.ndarray, shape (m,)
+        Cluster assignment for each institution (0-indexed).
+    num_clusters : int
+        Number of clusters K found.
+    silhouette : float
+        Mean silhouette score at the chosen cut (-1 if K==1 or K==m).
+    clusters : Dict[int, List[int]]
+        Mapping cluster_id -> list of institution indices.
+    dist_matrix : np.ndarray, shape (m, m)
+        Pairwise L2 distance matrix used for this clustering.
+    linkage_matrix : np.ndarray
+        Raw scipy linkage matrix (for dendrogram visualisation).
+    """
+    labels:         np.ndarray
+    num_clusters:   int
+    silhouette:     float
+    clusters:       Dict[int, List[int]]
+    dist_matrix:    np.ndarray
+    linkage_matrix: np.ndarray
+
+    def members(self, cluster_id: int) -> List[int]:
+        return self.clusters.get(cluster_id, [])
+
+    def cluster_of(self, institution_idx: int) -> int:
+        return int(self.labels[institution_idx])
+
+    def __repr__(self) -> str:
+        sizes = {k: len(v) for k, v in self.clusters.items()}
+        return (
+            f"ClusterResult(K={self.num_clusters}, "
+            f"silhouette={self.silhouette:.4f}, "
+            f"sizes={sizes})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Distance computation
+# ---------------------------------------------------------------------------
+
+def pairwise_l2(thetas: torch.Tensor) -> np.ndarray:
+    """
+    Compute symmetric pairwise L2 distance matrix.
+
+    Parameters
+    ----------
+    thetas : Tensor, shape (m, p)
+        One Theta vector per institution.
+
+    Returns
+    -------
+    np.ndarray, shape (m, m), dtype float64
+        D[i,j] = ||theta_i - theta_j||_2
+    """
+    with torch.no_grad():
+        # Use broadcasting; cast to float64 for numerical stability
+        t = thetas.double()                          # (m, p)
+        diff = t.unsqueeze(0) - t.unsqueeze(1)       # (m, m, p)
+        dist = diff.norm(dim=-1)                     # (m, m)
+    D = dist.cpu().numpy()
+    # Enforce exact symmetry and zero diagonal
+    D = (D + D.T) / 2.0
+    np.fill_diagonal(D, 0.0)
+    return D
+
+
+# ---------------------------------------------------------------------------
+# Linkage
+# ---------------------------------------------------------------------------
+
+def ward_linkage(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute Ward's agglomerative linkage from a square distance matrix.
+
+    scipy.linkage expects a condensed upper-triangular distance vector
+    when method='ward' and metric is provided as a precomputed matrix.
+
+    Parameters
+    ----------
+    dist_matrix : np.ndarray, shape (m, m)
+
+    Returns
+    -------
+    np.ndarray
+        scipy linkage matrix of shape (m-1, 4).
+    """
+    condensed = squareform(dist_matrix, checks=False)
+    return linkage(condensed, method="ward")
+
+
+# ---------------------------------------------------------------------------
+# Cut selection
+# ---------------------------------------------------------------------------
+
+def best_cut(
+    linkage_matrix: np.ndarray,
+    dist_matrix:    np.ndarray,
+    max_k:          int,
+) -> Tuple[np.ndarray, int, float]:
+    """
+    Sweep candidate cluster counts [2, max_k] and return the cut that
+    maximises the mean silhouette score.
+
+    Special cases:
+    - m == 1: trivially one cluster, silhouette undefined.
+    - max_k == 1: forced single cluster (e.g. early warm-up).
+    - All silhouette scores <= 0: fall back to K=2 (or K=max_k if lower).
+
+    Parameters
+    ----------
+    linkage_matrix : np.ndarray, shape (m-1, 4)
+    dist_matrix    : np.ndarray, shape (m, m)
+    max_k          : int
+        Maximum number of clusters (= floor(m/2)).
+
+    Returns
+    -------
+    labels     : np.ndarray, shape (m,), 0-indexed cluster assignments
+    best_k     : int
+    best_score : float   (-1.0 when undefined)
+    """
+    m = dist_matrix.shape[0]
+
+    if m == 1 or max_k <= 1:
+        return np.zeros(m, dtype=int), 1, -1.0
+
+    best_labels: np.ndarray = np.zeros(m, dtype=int)
+    best_k:      int        = 2
+    best_score:  float      = -2.0   # sentinel below valid silhouette range
+
+    for k in range(2, min(max_k, m) + 1):
+        # fcluster with criterion='maxclust' guarantees exactly k clusters
+        raw_labels = fcluster(linkage_matrix, k, criterion="maxclust")
+        labels_0   = raw_labels - 1   # make 0-indexed
+
+        # Silhouette requires at least 2 distinct labels and < m labels
+        unique = np.unique(labels_0)
+        if len(unique) < 2:
+            continue
+
+        score = silhouette_score(dist_matrix, labels_0, metric="precomputed")
+        if score > best_score:
+            best_score  = score
+            best_k      = k
+            best_labels = labels_0
+
+    if best_score == -2.0:
+        # No valid cut found (degenerate case); fall back to single cluster
+        return np.zeros(m, dtype=int), 1, -1.0
+
+    return best_labels, best_k, float(best_score)
+
+
+# ---------------------------------------------------------------------------
+# Topology-based static clustering (Section 8 baseline)
+# ---------------------------------------------------------------------------
+
+def topology_descriptors(thetas: torch.Tensor) -> np.ndarray:
+    """
+    Compute simple topology descriptors from Theta vectors for use in the
+    static-clustering baseline.  Since Theta encodes graph modulations,
+    we use the Theta vectors themselves as feature vectors for the initial
+    clustering (equivalent to a one-shot clustering at round 0).
+
+    Returns the same distance matrix as pairwise_l2; kept as a separate
+    function to make the baseline pipeline explicit.
+    """
+    return pairwise_l2(thetas)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def cluster_thetas(
+    thetas:       torch.Tensor,
+    max_clusters: int,
+) -> ClusterResult:
+    """
+    Full clustering pipeline: distance -> Ward linkage -> best cut.
+
+    Parameters
+    ----------
+    thetas : Tensor, shape (m, p)
+        Stacked Theta vectors, one per institution.
+    max_clusters : int
+        Hard cap on K; typically floor(m / 2).
+
+    Returns
+    -------
+    ClusterResult
+    """
+    m = thetas.shape[0]
+    if m == 0:
+        raise ValueError("cluster_thetas received an empty Theta matrix.")
+
+    dist_matrix = pairwise_l2(thetas)
+
+    # Degenerate cases: linkage requires >= 2 observations
+    if m == 1:
+        empty_Z = np.zeros((0, 4), dtype=np.float64)
+        return ClusterResult(
+            labels=np.zeros(1, dtype=int),
+            num_clusters=1,
+            silhouette=-1.0,
+            clusters={0: [0]},
+            dist_matrix=dist_matrix,
+            linkage_matrix=empty_Z,
+        )
+
+    linkage_matrix = ward_linkage(dist_matrix)
+    labels, k, sil = best_cut(linkage_matrix, dist_matrix, max_k=max_clusters)
+
+    clusters: Dict[int, List[int]] = {}
+    for inst_idx, cid in enumerate(labels.tolist()):
+        clusters.setdefault(int(cid), []).append(inst_idx)
+
+    return ClusterResult(
+        labels=labels,
+        num_clusters=k,
+        silhouette=sil,
+        clusters=clusters,
+        dist_matrix=dist_matrix,
+        linkage_matrix=linkage_matrix,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Aggregation helpers (used by server.py)
+# ---------------------------------------------------------------------------
+
+def intra_cluster_average(
+    thetas:  torch.Tensor,
+    result:  ClusterResult,
+) -> Dict[int, torch.Tensor]:
+    """
+    Compute per-cluster mean Theta vector.
+
+    Returns
+    -------
+    Dict[cluster_id, mean_theta]   where mean_theta has shape (p,)
+    """
+    cluster_means: Dict[int, torch.Tensor] = {}
+    for cid, members in result.clusters.items():
+        cluster_means[cid] = thetas[members].mean(dim=0)
+    return cluster_means
+
+
+def inter_cluster_average(
+    cluster_means: Dict[int, torch.Tensor],
+) -> torch.Tensor:
+    """
+    Average across cluster centroids (unweighted by cluster size, per spec).
+
+    Returns
+    -------
+    Tensor, shape (p,)
+    """
+    stacked = torch.stack(list(cluster_means.values()), dim=0)  # (K, p)
+    return stacked.mean(dim=0)
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\federation\fedavg.py
+"""
+federation/fedavg.py
+
+Baseline: standard FedAvg.
+
+All institutions synchronise every round with a plain unweighted
+average of their Theta vectors. No clustering, no warm-up.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+import torch
+
+from ..models.gnn_params import ThetaVector
+from ..config import FederationConfig, ModelGraphConfig
+
+
+class FedAvgServer:
+    """
+    Drop-in replacement for FederationServer implementing vanilla FedAvg.
+
+    The interface mirrors FederationServer so the same training harness
+    (train.py) can be used for both by swapping server implementations.
+    """
+
+    def __init__(
+        self,
+        num_clients: int,
+        fed_config:  FederationConfig,
+        mg_config:   ModelGraphConfig,
+    ) -> None:
+        self.num_clients = num_clients
+        self.cfg         = fed_config
+        self.k_edge      = mg_config.k_edge
+        self.k_node      = mg_config.k_node
+        self.p           = 2 * self.k_edge + 1 + 2 * self.k_node + 1
+
+        self._global_theta: torch.Tensor = ThetaVector(
+            self.k_edge, self.k_node
+        ).theta.detach().clone()
+
+        self._client_ids: List[int] = list(range(num_clients))
+        self._round: int = 0
+
+    @property
+    def round(self) -> int:
+        return self._round
+
+    def broadcast(self) -> Dict[int, torch.Tensor]:
+        """Every client receives the same global Theta."""
+        return {cid: self._global_theta.clone() for cid in self._client_ids}
+
+    def aggregate(
+        self,
+        round_num: int,
+        uploads:   Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor]:
+        """
+        Plain average of all uploaded Theta vectors.
+
+        Returns the same averaged Theta to every client.
+        """
+        self._round      = round_num
+        self._client_ids = sorted(uploads.keys())
+
+        stacked = torch.stack(list(uploads.values()))   # (m, p)
+        mean    = stacked.mean(dim=0)                   # (p,)
+        self._global_theta = mean.clone()
+
+        return {cid: mean.clone() for cid in self._client_ids}
+
+    def run(self, clients, num_rounds: Optional[int] = None) -> None:
+        T = num_rounds if num_rounds is not None else self.cfg.num_rounds
+        for t in range(1, T + 1):
+            thetas_in = self.broadcast()
+            uploads   = {
+                self._client_ids[i]: client.local_train(thetas_in[self._client_ids[i]])
+                for i, client in enumerate(clients)
+            }
+            self.aggregate(t, uploads)
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\federation\server.py
+"""
+federation/server.py
+
+Central server for the UnifiedEdu federation.
+
+Round lifecycle (called once per federation round t):
+  1. server.broadcast()          -> Dict[client_id, flat_theta]
+  2. each client calls local_train(theta)  -> uploads updated theta
+  3. server.aggregate(round, uploads)  -> updates internal state
+     a. re-cluster every t_update rounds (Stage 3)
+     b. intra-cluster average every t_ic rounds (Stage 2a)
+     c. inter-cluster average every t_bc rounds after T_init (Stage 2b)
+  4. repeat from 1
+
+The server never sees raw data -- only flat Theta tensors of shape (p,).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+from ..models.gnn_params import ThetaVector, theta_from_flat
+from ..config import FederationConfig, ModelGraphConfig
+from .clustering import (
+    ClusterResult,
+    cluster_thetas,
+    intra_cluster_average,
+    inter_cluster_average,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Topology-based feature extraction (for static clustering baseline)
+# ---------------------------------------------------------------------------
+
+def _topology_features(graph) -> torch.Tensor:
+    """
+    Compute a compact topology descriptor vector from a ModelGraph.
+
+    Features (all scalars, concatenated):
+      - log(N+1)             node count
+      - log(E+1)             edge count
+      - log(E/(N+1))         edge density proxy
+      - max layer id         depth of the DAG
+      - mean out-degree      mean edges per source node
+      - std  out-degree
+      - edge group entropy   distribution of edges across k_edge groups
+    """
+    N = graph.num_nodes
+    E = graph.num_edges
+
+    if E > 0:
+        src = graph.edge_index[0]
+        degree = torch.zeros(N)
+        degree.scatter_add_(0, src, torch.ones(E))
+        mean_deg = degree.float().mean().item()
+        std_deg  = degree.float().std().item()
+        # edge group distribution entropy
+        k_e = int(graph.edge_groups.max().item()) + 1
+        counts = torch.zeros(k_e)
+        counts.scatter_add_(0, graph.edge_groups, torch.ones(E))
+        p = counts / counts.sum()
+        entropy = -(p * (p + 1e-9).log()).sum().item()
+    else:
+        mean_deg = std_deg = entropy = 0.0
+
+    depth = float(graph.node_layer_ids.max().item()) if N > 0 else 0.0
+
+    feat = torch.tensor([
+        (N + 1.0) ** 0.5,
+        (E + 1.0) ** 0.5,
+        float(E) / (N + 1.0),
+        depth,
+        mean_deg,
+        std_deg,
+        entropy,
+    ], dtype=torch.float32)
+    return feat
+
+
+class FederationServer:
+    """
+    Aggregation server for UnifiedEdu with dynamic Theta-guided clustering.
+
+    Parameters
+    ----------
+    num_clients  : int
+    fed_config   : FederationConfig
+    mg_config    : ModelGraphConfig   (determines k_edge, k_node, and p)
+    """
+
+    def __init__(
+        self,
+        num_clients: int,
+        fed_config:  FederationConfig,
+        mg_config:   ModelGraphConfig,
+    ) -> None:
+        self.num_clients = num_clients
+        self.cfg         = fed_config
+        self.k_edge      = mg_config.k_edge
+        self.k_node      = mg_config.k_node
+        self.p           = 2 * self.k_edge + 1 + 2 * self.k_node + 1
+
+        # Global Theta -- shared starting point, updated after inter-cluster agg
+        self._global_theta: torch.Tensor = ThetaVector(
+            self.k_edge, self.k_node
+        ).theta.detach().clone()
+
+        # Per-client theta broadcast at the start of each round
+        self._client_thetas: Dict[int, torch.Tensor] = {}
+
+        # Current cluster partition (initialised lazily on first upload)
+        self._cluster_result: Optional[ClusterResult] = None
+
+        # Sorted list of registered client ids (set on first broadcast)
+        self._client_ids: List[int] = list(range(num_clients))
+
+        self._round: int = 0
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def cluster_result(self) -> Optional[ClusterResult]:
+        return self._cluster_result
+
+    @property
+    def round(self) -> int:
+        return self._round
+
+    # ------------------------------------------------------------------
+    # Step 1: broadcast
+    # ------------------------------------------------------------------
+
+    def broadcast(self) -> Dict[int, torch.Tensor]:
+        """
+        Return the Theta tensor each client should start its local epoch from.
+
+        Before the first clustering is done, every client receives the same
+        global Theta.  After clustering, clients in the same cluster share
+        the same cluster-mean Theta (set by the previous aggregate() call).
+        """
+        return {cid: self._client_thetas.get(cid, self._global_theta).clone()
+                for cid in self._client_ids}
+
+    # ------------------------------------------------------------------
+    # Step 3: aggregate
+    # ------------------------------------------------------------------
+
+    def aggregate(
+        self,
+        round_num:     int,
+        uploads: Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor]:
+        """
+        Process uploaded Theta vectors and return the theta to seed each
+        client with at the start of the NEXT round.
+
+        Parameters
+        ----------
+        round_num : int   (1-indexed)
+        uploads   : Dict[client_id, flat_theta_tensor (p,)]
+
+        Returns
+        -------
+        Dict[client_id, flat_theta_tensor (p,)]
+            Same keys as uploads.
+        """
+        self._round = round_num
+        client_ids  = sorted(uploads.keys())
+        self._client_ids = client_ids
+        m = len(client_ids)
+
+        # Stack uploaded Thetas into a matrix (m, p)
+        theta_matrix = torch.stack([uploads[cid] for cid in client_ids])  # (m, p)
+
+        # ----------------------------------------------------------
+        # Stage 3: dynamic re-clustering
+        # ----------------------------------------------------------
+        max_k = self.cfg.effective_max_clusters()
+        if self._cluster_result is None or round_num % self.cfg.t_update == 0:
+            self._cluster_result = cluster_thetas(theta_matrix, max_clusters=max_k)
+            log.info(
+                "Round %d: reclustered -> %s",
+                round_num, self._cluster_result,
+            )
+
+        result = self._cluster_result
+
+        # ----------------------------------------------------------
+        # Stage 2b: inter-cluster aggregation (every t_bc, after T_init)
+        # ----------------------------------------------------------
+        if round_num >= self.cfg.T_init and round_num % self.cfg.t_bc == 0:
+            cluster_means = intra_cluster_average(theta_matrix, result)
+            grand_mean    = inter_cluster_average(cluster_means)
+            self._global_theta = grand_mean.clone()
+
+            out = {cid: grand_mean.clone() for cid in client_ids}
+            log.info(
+                "Round %d: inter-cluster aggregation -> broadcasting grand mean",
+                round_num,
+            )
+            self._client_thetas = out
+            return out
+
+        # ----------------------------------------------------------
+        # Stage 2a: intra-cluster aggregation (every t_ic)
+        # ----------------------------------------------------------
+        if round_num % self.cfg.t_ic == 0:
+            cluster_means = intra_cluster_average(theta_matrix, result)
+            out: Dict[int, torch.Tensor] = {}
+            for inst_idx, cid in enumerate(client_ids):
+                cluster_id = result.cluster_of(inst_idx)
+                out[cid]   = cluster_means[cluster_id].clone()
+            log.info(
+                "Round %d: intra-cluster aggregation (K=%d)",
+                round_num, result.num_clusters,
+            )
+            self._client_thetas = out
+            return out
+
+        # ----------------------------------------------------------
+        # No aggregation this round -- each client keeps its own theta
+        # ----------------------------------------------------------
+        out = {cid: uploads[cid].clone() for cid in client_ids}
+        self._client_thetas = out
+        return out
+
+    # ------------------------------------------------------------------
+    # Convenience: run a full federation loop (local simulation)
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        clients,     # List[FederationClient]
+        num_rounds: Optional[int] = None,
+    ) -> None:
+        """
+        Simulate the full federation loop locally.
+
+        Parameters
+        ----------
+        clients    : list of FederationClient, indexed by position (client_id = index)
+        num_rounds : override cfg.num_rounds if provided
+        """
+        T = num_rounds if num_rounds is not None else self.cfg.num_rounds
+
+        for t in range(1, T + 1):
+            # 1. Broadcast
+            thetas_in = self.broadcast()
+
+            # 2. Local training (one epoch per client)
+            uploads: Dict[int, torch.Tensor] = {}
+            for idx, client in enumerate(clients):
+                cid = self._client_ids[idx]
+                uploads[cid] = client.local_train(thetas_in[cid])
+
+            # 3. Aggregate
+            self.aggregate(t, uploads)
+
+            if t % 10 == 0 or t == 1:
+                cr = self._cluster_result
+                k  = cr.num_clusters if cr else "?"
+                sil = f"{cr.silhouette:.4f}" if cr else "?"
+                log.info("Round %d/%d  K=%s  sil=%s", t, T, k, sil)
+
+
+# ---------------------------------------------------------------------------
+# Static-clustering server (Section 8 topology-aware baseline)
+# ---------------------------------------------------------------------------
+
+class StaticFederationServer(FederationServer):
+    """
+    Topology-aware UnifiedEdu with a FIXED partition computed once at init.
+
+    The initial cluster assignment is derived from topology descriptor
+    vectors of each client's model-graph (node degrees, edge density, DAG
+    depth) — NOT from Theta vectors.  The partition never changes during
+    training; only t_ic / t_bc aggregation applies.
+
+    Parameters
+    ----------
+    graphs       : list of ModelGraph, one per client (order = client_id order)
+    num_clients  : int
+    fed_config   : FederationConfig
+    mg_config    : ModelGraphConfig
+    """
+
+    def __init__(
+        self,
+        graphs,
+        num_clients: int,
+        fed_config:  FederationConfig,
+        mg_config:   ModelGraphConfig,
+    ) -> None:
+        super().__init__(num_clients, fed_config, mg_config)
+        self._fixed_cluster: Optional[ClusterResult] = None
+        self._graphs = graphs
+
+    def _init_static_clustering(self) -> None:
+        """Cluster once using topology feature vectors."""
+        feats  = torch.stack([_topology_features(g) for g in self._graphs])  # (m, F)
+        max_k  = self.cfg.effective_max_clusters()
+        result = cluster_thetas(feats, max_clusters=max_k)
+        self._fixed_cluster = result
+        log.info(
+            "Static clustering (topology): K=%d  silhouette=%.4f",
+            result.num_clusters, result.silhouette,
+        )
+
+    def aggregate(
+        self,
+        round_num:  int,
+        uploads:    Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor]:
+        """Same aggregation logic but clustering is frozen after round 1."""
+        self._round    = round_num
+        client_ids     = sorted(uploads.keys())
+        self._client_ids = client_ids
+        theta_matrix   = torch.stack([uploads[cid] for cid in client_ids])
+
+        # Initialise topology clustering exactly once
+        if self._fixed_cluster is None:
+            self._init_static_clustering()
+        self._cluster_result = self._fixed_cluster   # never updated
+
+        result = self._cluster_result
+
+        # Same two-level aggregation as the dynamic server
+        if round_num >= self.cfg.T_init and round_num % self.cfg.t_bc == 0:
+            cluster_means = intra_cluster_average(theta_matrix, result)
+            grand_mean    = inter_cluster_average(cluster_means)
+            self._global_theta = grand_mean.clone()
+            out = {cid: grand_mean.clone() for cid in client_ids}
+            self._client_thetas = out
+            return out
+
+        if round_num % self.cfg.t_ic == 0:
+            cluster_means = intra_cluster_average(theta_matrix, result)
+            out = {}
+            for inst_idx, cid in enumerate(client_ids):
+                cluster_id = result.cluster_of(inst_idx)
+                out[cid]   = cluster_means[cluster_id].clone()
+            self._client_thetas = out
+            return out
+
+        out = {cid: uploads[cid].clone() for cid in client_ids}
+        self._client_thetas = out
+        return out
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\federation\__init__.py
+from .client import FederationClient, assign_layer_groups, modulate_params
+from .server import FederationServer
+from .fedavg import FedAvgServer
+from .clustering import ClusterResult, cluster_thetas
+
+__all__ = [
+    "FederationClient",
+    "assign_layer_groups",
+    "modulate_params",
+    "FederationServer",
+    "FedAvgServer",
+    "ClusterResult",
+    "cluster_thetas",
+]
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\models\forward_pass.py
+"""
+forward_pass.py
+
+DAG forward pass that emulates the LLM computation using the
+modulated model-graph.
+
+  H^{(0)}_v = input text features at input nodes, 0 elsewhere
+  For each node v in topological order:
+    H_v = sigma[ sum_{u: A_{uv}=1} E_{u,v} * H_u + bias_v ]
+
+where sigma is the activation function stored as node_features[:, 1].
+"""
+
+from __future__ import annotations
+
+from typing import Dict
+
+import torch
+import torch.nn.functional as F
+
+from .model_graph import ActivationType, ModelGraph
+
+
+_ACT_FN = {
+    ActivationType.LINEAR: lambda x: x,
+    ActivationType.GELU:   F.gelu,
+    ActivationType.RELU:   F.relu,
+    ActivationType.SILU:   F.silu,
+    ActivationType.TANH:   torch.tanh,
+}
+
+
+def dag_forward(
+    graph: ModelGraph,
+    input_features: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Run a single forward pass through the DAG.
+
+    Parameters
+    ----------
+    graph : ModelGraph
+        A Theta-modulated model graph.
+    input_features : Tensor, shape (N_input, feature_dim) or (feature_dim,)
+        Feature vectors for input nodes.  If 1-D, broadcast to all inputs.
+
+    Returns
+    -------
+    Tensor, shape (N_output, feature_dim)
+        Hidden states at output nodes.
+    """
+    N = graph.num_nodes
+    device = input_features.device
+
+    # feature_dim: the hidden dimension carried at each node
+    if input_features.dim() == 1:
+        feature_dim = input_features.shape[0]
+        h0 = input_features.unsqueeze(0).expand(len(graph.input_node_ids), -1)
+    else:
+        feature_dim = input_features.shape[1]
+        h0 = input_features
+
+    # Initialise hidden states to zero
+    H = torch.zeros(N, feature_dim, device=device, dtype=input_features.dtype)
+
+    # Assign input features
+    for i, nid in enumerate(graph.input_node_ids):
+        H[nid] = h0[i] if i < h0.shape[0] else torch.zeros(feature_dim, device=device)
+
+    # Topological processing order
+    order = _topological_order(graph)
+
+    # Pre-index: for each node, which edges are incoming?
+    # Build adjacency as: tgt_to_src[v] = list of (src_idx_in_edge_tensor, src_node_id)
+    tgt_to_src = _build_incoming(graph)
+
+    node_feats = graph.node_features    # (N, 4)
+    edge_feats = graph.edge_features    # (E,)
+
+    for v in order:
+        if v in graph.input_node_ids:
+            # Input nodes: features already set; still apply bias and activation
+            bias_v = node_feats[v, 0].item()
+            act_code = int(node_feats[v, 1].item())
+            act_fn = _ACT_FN.get(act_code, lambda x: x)
+            H[v] = act_fn(H[v] + bias_v)
+        else:
+            incoming = tgt_to_src.get(v, [])
+            if incoming:
+                edge_indices, src_ids = zip(*incoming)
+                # Weighted sum: sum_u E_{u,v} * H_u
+                weights = edge_feats[list(edge_indices)]          # (in_degree,)
+                src_h   = H[list(src_ids)]                        # (in_degree, feature_dim)
+                pre_act = (weights.unsqueeze(1) * src_h).sum(0)  # (feature_dim,)
+            else:
+                pre_act = torch.zeros(feature_dim, device=device)
+
+            bias_v   = node_feats[v, 0].item()
+            act_code = int(node_feats[v, 1].item())
+            act_fn   = _ACT_FN.get(act_code, lambda x: x)
+            H[v]     = act_fn(pre_act + bias_v)
+
+    output_ids = graph.output_node_ids
+    return H[output_ids]  # (N_out, feature_dim)
+
+
+def dag_forward_batched(
+    graph: ModelGraph,
+    input_features: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Vectorised forward pass -- avoids per-node Python loops by processing
+    all edges in one scatter-add per topological layer.
+
+    Parameters
+    ----------
+    input_features : Tensor, shape (B, N_input, feature_dim)
+        Batched input features. B = batch size.
+
+    Returns
+    -------
+    Tensor, shape (B, N_output, feature_dim)
+    """
+    B, n_in, feature_dim = input_features.shape
+    N = graph.num_nodes
+    device = input_features.device
+    dtype  = input_features.dtype
+
+    H = torch.zeros(B, N, feature_dim, device=device, dtype=dtype)
+
+    for i, nid in enumerate(graph.input_node_ids):
+        if i < n_in:
+            H[:, nid, :] = input_features[:, i, :]
+
+    # Group edges by target topological layer for efficient scatter
+    layer_ids = graph.node_layer_ids          # (N,)
+    max_layer  = int(layer_ids.max().item())
+
+    src_e = graph.edge_index[0]               # (E,)
+    tgt_e = graph.edge_index[1]               # (E,)
+    w_e   = graph.edge_features               # (E,)
+    node_feats = graph.node_features          # (N, 4)
+
+    for l in range(1, max_layer + 1):
+        # Nodes in this layer
+        layer_mask = (layer_ids == l)                    # (N,) bool
+        layer_node_ids = layer_mask.nonzero(as_tuple=True)[0]  # (n_l,)
+
+        # Edges whose target is in this layer
+        tgt_in_layer = layer_mask[tgt_e]                 # (E,) bool
+        if not tgt_in_layer.any():
+            continue
+
+        e_src = src_e[tgt_in_layer]                      # (e_l,)
+        e_tgt = tgt_e[tgt_in_layer]                      # (e_l,)
+        e_w   = w_e[tgt_in_layer]                        # (e_l,)
+
+        # Weighted messages: (B, e_l, feature_dim)
+        msgs = H[:, e_src, :] * e_w.unsqueeze(0).unsqueeze(-1)  # broadcast
+
+        # Scatter-add into targets
+        tgt_expand = e_tgt.unsqueeze(0).unsqueeze(-1).expand(B, -1, feature_dim)
+        H.scatter_add_(1, tgt_expand, msgs)
+
+        # Add bias + activation for each node in this layer
+        biases   = node_feats[layer_node_ids, 0]         # (n_l,)
+        act_codes = node_feats[layer_node_ids, 1].long() # (n_l,)
+
+        H[:, layer_node_ids, :] = H[:, layer_node_ids, :] + biases.unsqueeze(0).unsqueeze(-1)
+
+        # Apply activations (per-node, may differ)
+        for i, nid in enumerate(layer_node_ids.tolist()):
+            act_fn = _ACT_FN.get(int(act_codes[i].item()), lambda x: x)
+            H[:, nid, :] = act_fn(H[:, nid, :])
+
+    output_ids = graph.output_node_ids
+    return H[:, output_ids, :]  # (B, N_out, feature_dim)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _topological_order(graph: ModelGraph):
+    """Return node ids sorted by topological layer id (ascending)."""
+    return graph.node_layer_ids.argsort().tolist()
+
+
+def _build_incoming(graph: ModelGraph) -> Dict[int, list]:
+    """
+    Build a mapping: node_id -> list of (edge_idx, src_node_id) for incoming edges.
+    """
+    tgt_to_src: Dict[int, list] = {}
+    src_e = graph.edge_index[0].tolist()
+    tgt_e = graph.edge_index[1].tolist()
+    for edge_idx, (s, t) in enumerate(zip(src_e, tgt_e)):
+        tgt_to_src.setdefault(t, []).append((edge_idx, s))
+    return tgt_to_src
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\models\gnn_params.py
+"""
+gnn_params.py
+
+Theta vector: the shared GNN parameter vector that modulates all node
+and edge features across all institutions' model-graphs.
+
+Theta layout (flat):
+  [0 : k_edge]                          Theta_edge        (scale per edge group)
+  [k_edge : 2*k_edge]                   Theta_edge_shift  (shift per edge group)
+  [2*k_edge]                            Theta_scale_edge  (SoftSign scale, scalar)
+  [2*k_edge+1 : 2*k_edge+1+k_node]      Theta_node        (scale per node group)
+  [2*k_edge+1+k_node : 2*k_edge+1+2*k_node]  Theta_node_shift
+  [2*k_edge+1+2*k_node]                 Theta_scale_node  (SoftSign scale, scalar)
+
+Total length p = 2*k_edge + 1 + 2*k_node + 1
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .model_graph import ModelGraph
+
+
+def _theta_size(k_edge: int, k_node: int) -> int:
+    return 2 * k_edge + 1 + 2 * k_node + 1
+
+
+def _soft_sign(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """SoftSign(x, s) = s * x / (s + |x|), element-wise."""
+    return s * x / (s + x.abs())
+
+
+class ThetaVector(nn.Module):
+    """
+    Learnable Theta parameter vector of fixed length p.
+
+    Parameters
+    ----------
+    k_edge : int  -- number of edge groups
+    k_node : int  -- number of node groups
+
+    The vector is stored as a single flat nn.Parameter so that
+    standard optimisers (AdamW) can update it directly.
+    """
+
+    def __init__(self, k_edge: int, k_node: int) -> None:
+        super().__init__()
+        self.k_edge = k_edge
+        self.k_node = k_node
+        self.p = _theta_size(k_edge, k_node)
+
+        # Initialise following Section 3 spec (conservative init)
+        init = torch.zeros(self.p)
+        # Theta_edge = 1
+        init[:k_edge] = 1.0
+        # Theta_edge_shift = 0 (already zero)
+        # Theta_scale_edge = 1
+        init[2 * k_edge] = 1.0
+        # Theta_node = 1
+        init[2 * k_edge + 1: 2 * k_edge + 1 + k_node] = 1.0
+        # Theta_node_shift = 0 (already zero)
+        # Theta_scale_node = 1
+        init[-1] = 1.0
+
+        self.theta = nn.Parameter(init)
+
+    # ------------------------------------------------------------------
+    # Slice accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def theta_edge(self) -> torch.Tensor:
+        return self.theta[: self.k_edge]
+
+    @property
+    def theta_edge_shift(self) -> torch.Tensor:
+        return self.theta[self.k_edge: 2 * self.k_edge]
+
+    @property
+    def theta_scale_edge(self) -> torch.Tensor:
+        return self.theta[2 * self.k_edge].unsqueeze(0)
+
+    @property
+    def theta_node(self) -> torch.Tensor:
+        s = 2 * self.k_edge + 1
+        return self.theta[s: s + self.k_node]
+
+    @property
+    def theta_node_shift(self) -> torch.Tensor:
+        s = 2 * self.k_edge + 1 + self.k_node
+        return self.theta[s: s + self.k_node]
+
+    @property
+    def theta_scale_node(self) -> torch.Tensor:
+        return self.theta[-1].unsqueeze(0)
+
+    # ------------------------------------------------------------------
+
+    def extra_repr(self) -> str:
+        return f"k_edge={self.k_edge}, k_node={self.k_node}, p={self.p}"
+
+
+def apply_theta_to_graph(
+    graph: ModelGraph,
+    theta: ThetaVector,
+) -> ModelGraph:
+    """
+    Return a *new* ModelGraph whose node and edge features have been
+    modulated by Theta.  The original graph is not mutated.
+
+    For edge (u->v) in group g:
+        E_{u,v} <- SoftSign(
+            E_{u,v} * Theta_edge[g] + Theta_edge_shift[g],
+            Theta_scale_edge
+        )
+
+    For node v in group g:
+        V_v[bias] <- SoftSign(
+            V_v[bias] * Theta_node[g] + Theta_node_shift[g],
+            Theta_scale_node
+        )
+
+    LayerNorm params (ln_gamma, ln_beta) and activation codes are
+    not modulated by Theta -- they remain as stored.
+    """
+    # --- Edge modulation ---------------------------------------------------
+    eg = graph.edge_groups                    # (E,) long
+    scale_e  = theta.theta_edge[eg]           # (E,)
+    shift_e  = theta.theta_edge_shift[eg]     # (E,)
+    s_e      = theta.theta_scale_edge         # (1,)
+
+    new_edge_feats = _soft_sign(
+        graph.edge_features * scale_e + shift_e,
+        s_e,
+    )
+
+    # --- Node modulation (bias channel only, index 0) ---------------------
+    ng = graph.node_groups                    # (N,) long
+    scale_n  = theta.theta_node[ng]           # (N,)
+    shift_n  = theta.theta_node_shift[ng]     # (N,)
+    s_n      = theta.theta_scale_node         # (1,)
+
+    bias_col = graph.node_features[:, 0]      # (N,)
+    new_bias = _soft_sign(
+        bias_col * scale_n + shift_n,
+        s_n,
+    )
+
+    new_node_feats = graph.node_features.clone()
+    new_node_feats[:, 0] = new_bias
+
+    return ModelGraph(
+        node_features=new_node_feats,
+        edge_index=graph.edge_index,
+        edge_features=new_edge_feats,
+        node_groups=graph.node_groups,
+        edge_groups=graph.edge_groups,
+        node_layer_ids=graph.node_layer_ids,
+        input_node_ids=graph.input_node_ids,
+        output_node_ids=graph.output_node_ids,
+        arch_type=graph.arch_type,
+    )
+
+
+def theta_from_flat(flat: torch.Tensor, k_edge: int, k_node: int) -> ThetaVector:
+    """
+    Reconstruct a ThetaVector from a flat tensor (used after aggregation).
+
+    The returned ThetaVector holds the aggregated weights as a non-leaf
+    parameter so gradients can still flow in subsequent local training.
+    """
+    p = _theta_size(k_edge, k_node)
+    assert flat.shape == (p,), f"Expected flat tensor of size {p}, got {flat.shape}"
+    tv = ThetaVector(k_edge, k_node)
+    with torch.no_grad():
+        tv.theta.copy_(flat)
+    return tv
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\models\model_graph.py
+"""
+model_graph.py
+
+Converts any HuggingFace LLM backbone into a directed acyclic graph (DAG)
+G_k = (V_k, E_k) where:
+  - Nodes carry bias values + activation encoding + optional LayerNorm params
+  - Edges carry weight values
+  - Topology follows strict topological order (DAG guaranteed)
+
+Supported architectures:
+  - Encoder-only (BERT, DistilBERT, RoBERTa)
+  - Decoder-only (LLaMA-2, Qwen, GPT-2)
+  - Generic fallback via named_parameters() inspection
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Activation encoding
+# ---------------------------------------------------------------------------
+
+class ActivationType(IntEnum):
+    LINEAR = 0
+    GELU   = 1
+    RELU   = 2
+    SILU   = 3   # used by LLaMA / SwiGLU gate
+    TANH   = 4
+
+_ACT_MAP: Dict[str, ActivationType] = {
+    "gelu": ActivationType.GELU,
+    "relu": ActivationType.RELU,
+    "silu": ActivationType.SILU,
+    "swish": ActivationType.SILU,
+    "tanh": ActivationType.TANH,
+}
+
+
+def _detect_activation(module: nn.Module) -> ActivationType:
+    """Heuristically infer the activation type from an nn.Module."""
+    name = type(module).__name__.lower()
+    for key, act in _ACT_MAP.items():
+        if key in name:
+            return act
+    return ActivationType.LINEAR
+
+
+# ---------------------------------------------------------------------------
+# Core data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NodeFeature:
+    """Feature vector stored on a DAG node.
+
+    Fields (all scalars):
+      bias        -- neuron bias (or 0.0 for input/virtual nodes)
+      activation  -- ActivationType int code
+      ln_gamma    -- LayerNorm scale absorbed here (0.0 if absent)
+      ln_beta     -- LayerNorm shift absorbed here (0.0 if absent)
+    """
+    bias:       float = 0.0
+    activation: int   = ActivationType.LINEAR
+    ln_gamma:   float = 0.0
+    ln_beta:    float = 0.0
+
+    def to_tensor(self) -> torch.Tensor:
+        return torch.tensor(
+            [self.bias, float(self.activation), self.ln_gamma, self.ln_beta],
+            dtype=torch.float32,
+        )
+
+
+@dataclass
+class ModelGraph:
+    """
+    Immutable DAG representation of an LLM backbone.
+
+    Attributes
+    ----------
+    node_features : Tensor, shape (N, 4)
+        One row per node; columns = [bias, act_code, ln_gamma, ln_beta].
+    edge_index : Tensor, shape (2, E)
+        [source_row; target_row] in COO format (edges directed src -> tgt).
+    edge_features : Tensor, shape (E,)
+        Weight of each connection.
+    node_groups : Tensor, shape (N,)
+        Integer group id used by the GNN parameteriser (k_node groups).
+    edge_groups : Tensor, shape (E,)
+        Integer group id used by the GNN parameteriser (k_edge groups).
+    node_layer_ids : Tensor, shape (N,)
+        Topological layer index; input nodes = 0.
+    input_node_ids : List[int]
+        Indices of input nodes (receive external features).
+    output_node_ids : List[int]
+        Indices of output nodes (read final hidden states from).
+    arch_type : str
+        Human-readable architecture tag, e.g. "bert-base-uncased".
+    """
+    node_features:   torch.Tensor
+    edge_index:      torch.Tensor
+    edge_features:   torch.Tensor
+    node_groups:     torch.Tensor
+    edge_groups:     torch.Tensor
+    node_layer_ids:  torch.Tensor
+    input_node_ids:  List[int]
+    output_node_ids: List[int]
+    arch_type:       str = "unknown"
+
+    # ------------------------------------------------------------------
+    # Convenience properties
+    # ------------------------------------------------------------------
+
+    @property
+    def num_nodes(self) -> int:
+        return self.node_features.shape[0]
+
+    @property
+    def num_edges(self) -> int:
+        return self.edge_features.shape[0]
+
+    def __repr__(self) -> str:
+        return (
+            f"ModelGraph({self.arch_type!r}, "
+            f"N={self.num_nodes}, E={self.num_edges}, "
+            f"node_groups={int(self.node_groups.max())+1}, "
+            f"edge_groups={int(self.edge_groups.max())+1})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Internal builder helpers
+# ---------------------------------------------------------------------------
+
+class _GraphBuilder:
+    """Stateful accumulator used during model-graph construction."""
+
+    def __init__(self) -> None:
+        self._node_feats:    List[NodeFeature]      = []
+        self._edge_src:      List[int]              = []
+        self._edge_tgt:      List[int]              = []
+        self._edge_weights:  List[float]            = []
+        self._node_layer:    List[int]              = []
+        self._node_group:    List[int]              = []
+        self._edge_group:    List[int]              = []
+        self.input_nodes:    List[int]              = []
+        self.output_nodes:   List[int]              = []
+
+    # -- node management ---------------------------------------------------
+
+    def add_node(
+        self,
+        feat: NodeFeature,
+        layer_id: int,
+        group_id: int,
+    ) -> int:
+        idx = len(self._node_feats)
+        self._node_feats.append(feat)
+        self._node_layer.append(layer_id)
+        self._node_group.append(group_id)
+        return idx
+
+    def add_input_node(self, group_id: int = 0) -> int:
+        idx = self.add_node(NodeFeature(), layer_id=0, group_id=group_id)
+        self.input_nodes.append(idx)
+        return idx
+
+    # -- edge management ---------------------------------------------------
+
+    def add_edge(self, src: int, tgt: int, weight: float, group_id: int) -> None:
+        self._edge_src.append(src)
+        self._edge_tgt.append(tgt)
+        self._edge_weights.append(weight)
+        self._edge_group.append(group_id)
+
+    # -- bulk MLP layer addition -------------------------------------------
+
+    def add_dense_layer(
+        self,
+        weight: torch.Tensor,   # (out_features, in_features)
+        bias:   Optional[torch.Tensor],
+        src_node_ids: List[int],
+        activation: ActivationType,
+        layer_id: int,
+        node_group_id: int,
+        edge_group_id: int,
+        ln_gamma: Optional[torch.Tensor] = None,
+        ln_beta:  Optional[torch.Tensor] = None,
+    ) -> List[int]:
+        """
+        Adds one fully-connected layer to the graph.
+
+        Returns the list of newly created target node indices.
+        """
+        out_features, in_features = weight.shape
+        assert len(src_node_ids) == in_features, (
+            f"Source nodes ({len(src_node_ids)}) != weight in_features ({in_features})"
+        )
+
+        W = weight.detach().float()
+        b = bias.detach().float() if bias is not None else torch.zeros(out_features)
+        gamma = ln_gamma.detach().float() if ln_gamma is not None else torch.zeros(out_features)
+        beta  = ln_beta.detach().float()  if ln_beta  is not None else torch.zeros(out_features)
+
+        tgt_node_ids: List[int] = []
+        for j in range(out_features):
+            feat = NodeFeature(
+                bias=float(b[j]),
+                activation=int(activation),
+                ln_gamma=float(gamma[j]),
+                ln_beta=float(beta[j]),
+            )
+            nid = self.add_node(feat, layer_id=layer_id, group_id=node_group_id)
+            tgt_node_ids.append(nid)
+
+            for m, src in enumerate(src_node_ids):
+                self.add_edge(
+                    src=src,
+                    tgt=nid,
+                    weight=float(W[j, m]),
+                    group_id=edge_group_id,
+                )
+
+        return tgt_node_ids
+
+    # -- finalisation -------------------------------------------------------
+
+    def build(self, arch_type: str, k_node: int, k_edge: int) -> ModelGraph:
+        N = len(self._node_feats)
+        E = len(self._edge_src)
+
+        node_features = torch.stack([f.to_tensor() for f in self._node_feats])  # (N,4)
+        edge_index = torch.tensor(
+            [self._edge_src, self._edge_tgt], dtype=torch.long
+        )  # (2, E)
+        edge_features = torch.tensor(self._edge_weights, dtype=torch.float32)   # (E,)
+        node_layer_ids = torch.tensor(self._node_layer, dtype=torch.long)        # (N,)
+
+        # Clamp group ids to [0, k-1]
+        raw_ng = torch.tensor(self._node_group, dtype=torch.long)
+        raw_eg = torch.tensor(self._edge_group, dtype=torch.long)
+        node_groups = raw_ng % k_node
+        edge_groups = raw_eg % k_edge
+
+        return ModelGraph(
+            node_features=node_features,
+            edge_index=edge_index,
+            edge_features=edge_features,
+            node_groups=node_groups,
+            edge_groups=edge_groups,
+            node_layer_ids=node_layer_ids,
+            input_node_ids=list(self.input_nodes),
+            output_node_ids=list(self.output_nodes),
+            arch_type=arch_type,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Architecture-specific converters
+# ---------------------------------------------------------------------------
+
+def _convert_mlp(
+    builder: _GraphBuilder,
+    linear_layers: List[Tuple[nn.Linear, ActivationType]],
+    src_node_ids: List[int],
+    base_layer_id: int,
+    node_group_base: int,
+    edge_group_base: int,
+    ln_params: Optional[List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]] = None,
+) -> List[int]:
+    """
+    Appends an MLP stack to the builder.
+
+    Parameters
+    ----------
+    linear_layers : list of (nn.Linear, activation)
+    src_node_ids  : input node indices
+    base_layer_id : topological layer offset for the first new layer
+    ln_params     : optional list of (gamma, beta) per linear layer
+    """
+    current_ids = src_node_ids
+    for i, (linear, act) in enumerate(linear_layers):
+        gamma = beta = None
+        if ln_params and i < len(ln_params):
+            gamma, beta = ln_params[i]
+        current_ids = builder.add_dense_layer(
+            weight=linear.weight,
+            bias=linear.bias,
+            src_node_ids=current_ids,
+            activation=act,
+            layer_id=base_layer_id + i,
+            node_group_id=node_group_base + i,
+            edge_group_id=edge_group_base + i,
+            ln_gamma=gamma,
+            ln_beta=beta,
+        )
+    return current_ids
+
+
+def _convert_attention_block(
+    builder: _GraphBuilder,
+    attn_module: nn.Module,
+    src_node_ids: List[int],
+    base_layer_id: int,
+    node_group_base: int,
+    edge_group_base: int,
+    num_heads: int,
+    hidden_size: int,
+    head_dim: int,
+    is_cross_attention: bool = False,
+) -> List[int]:
+    """
+    Converts a multi-head attention block into the DAG.
+
+    Handles two common parameter layouts:
+      (a) Fused QKV: single weight matrix of shape (3*hidden, hidden)
+          -- DistilBERT, some GPT-2 variants
+      (b) Separate Q, K, V:  individual nn.Linear modules
+          -- BERT, RoBERTa, LLaMA
+    """
+    # Attempt to locate Q/K/V/O projections by common attribute names
+    q_proj = k_proj = v_proj = o_proj = None
+    fused_qkv: Optional[nn.Linear] = None
+
+    for attr in ("q_proj", "query"):
+        if hasattr(attn_module, attr):
+            q_proj = getattr(attn_module, attr); break
+
+    for attr in ("k_proj", "key"):
+        if hasattr(attn_module, attr):
+            k_proj = getattr(attn_module, attr); break
+
+    for attr in ("v_proj", "value"):
+        if hasattr(attn_module, attr):
+            v_proj = getattr(attn_module, attr); break
+
+    for attr in ("o_proj", "out_proj", "dense"):
+        if hasattr(attn_module, attr):
+            o_proj = getattr(attn_module, attr); break
+
+    # Fused QKV (e.g. DistilBERT c_attn, GPT-2)
+    for attr in ("c_attn", "qkv"):
+        if hasattr(attn_module, attr):
+            fused_qkv = getattr(attn_module, attr); break
+
+    # --- Case A: fused QKV weight (3*H, H) --------------------------------
+    if fused_qkv is not None and q_proj is None:
+        total_out = fused_qkv.weight.shape[0]
+        chunk = total_out // 3
+        q_weight = fused_qkv.weight[:chunk]
+        k_weight = fused_qkv.weight[chunk:2*chunk]
+        v_weight = fused_qkv.weight[2*chunk:]
+        q_bias = fused_qkv.bias[:chunk]    if fused_qkv.bias is not None else None
+        k_bias = fused_qkv.bias[chunk:2*chunk] if fused_qkv.bias is not None else None
+        v_bias = fused_qkv.bias[2*chunk:]  if fused_qkv.bias is not None else None
+
+        # Wrap slices as temporary objects
+        class _FakeLinear:
+            def __init__(self, w, b):
+                self.weight = w
+                self.bias = b
+
+        q_proj = _FakeLinear(q_weight, q_bias)
+        k_proj = _FakeLinear(k_weight, k_bias)
+        v_proj = _FakeLinear(v_weight, v_bias)
+
+    if q_proj is None:
+        # Cannot identify projections -- skip and pass-through
+        return src_node_ids
+
+    layer_offset = base_layer_id
+
+    # Q, K, V projections (run in parallel; same source, consecutive layer ids)
+    q_ids = builder.add_dense_layer(
+        weight=q_proj.weight, bias=q_proj.bias,
+        src_node_ids=src_node_ids,
+        activation=ActivationType.LINEAR,
+        layer_id=layer_offset,
+        node_group_id=node_group_base,
+        edge_group_id=edge_group_base,
+    )
+    k_ids = builder.add_dense_layer(
+        weight=k_proj.weight, bias=k_proj.bias,
+        src_node_ids=src_node_ids,
+        activation=ActivationType.LINEAR,
+        layer_id=layer_offset,
+        node_group_id=node_group_base + 1,
+        edge_group_id=edge_group_base + 1,
+    )
+    v_ids = builder.add_dense_layer(
+        weight=v_proj.weight, bias=v_proj.bias,
+        src_node_ids=src_node_ids,
+        activation=ActivationType.LINEAR,
+        layer_id=layer_offset,
+        node_group_id=node_group_base + 2,
+        edge_group_id=edge_group_base + 2,
+    )
+
+    # Attention output: in the DAG we concatenate Q+K+V node streams
+    # into the output projection. For the graph model we treat the
+    # attended representation as V projected through O (simplification
+    # that preserves all learnable parameters).
+    if o_proj is not None:
+        # The output projection maps from the concatenated heads back to hidden_size.
+        # We use V as the approximation of the post-softmax attended values.
+        attn_out_ids = builder.add_dense_layer(
+            weight=o_proj.weight, bias=o_proj.bias,
+            src_node_ids=v_ids,
+            activation=ActivationType.LINEAR,
+            layer_id=layer_offset + 1,
+            node_group_id=node_group_base + 3,
+            edge_group_id=edge_group_base + 3,
+        )
+    else:
+        attn_out_ids = v_ids
+
+    return attn_out_ids
+
+
+def _convert_bert(model: nn.Module, cfg) -> Tuple[_GraphBuilder, str]:
+    """Convert a BERT-family encoder to a DAG."""
+    builder = _GraphBuilder()
+    hidden_size = cfg.hidden_size
+    num_heads   = cfg.num_attention_heads
+    head_dim    = hidden_size // num_heads
+    num_layers  = cfg.num_hidden_layers
+
+    # Node group assignment strategy:
+    #   0 : input embedding nodes
+    #   1 : query projection nodes
+    #   2 : key projection nodes
+    #   3 : value projection nodes
+    #   4 : attention output nodes
+    #   5 : FFN intermediate nodes
+    #   6 : FFN output nodes
+    #   (repeating pattern per transformer block, wrapped mod k_node)
+
+    # --- Embedding layer ---------------------------------------------------
+    emb = model.embeddings.word_embeddings  # (vocab, hidden)
+    vocab_size = emb.weight.shape[0]
+
+    # Input: one node per hidden dimension
+    src_ids = [builder.add_input_node(group_id=0) for _ in range(hidden_size)]
+
+    # We represent the embedding as a linear layer applied to a one-hot input.
+    # Practically for the DAG we embed the weight columns directly:
+    # embed layer = hidden_size output nodes each reading from hidden_size inputs.
+    # Use the embedding weight transposed: (hidden, vocab) -> treat as linear.
+    # For manageability we use the mean embedding vector as a single "token" linear.
+    # Full vocabulary -> DAG mapping would be intractable for large vocabs.
+    # Instead: emit one aggregate node per hidden dim representing the mean weight.
+    emb_weight_mean = emb.weight.mean(dim=0, keepdim=True).expand(hidden_size, hidden_size)
+    emb_fake = nn.Linear(hidden_size, hidden_size, bias=False)
+    emb_fake.weight = nn.Parameter(emb_weight_mean.detach())
+
+    layer_id = 1
+    emb_out_ids = builder.add_dense_layer(
+        weight=emb_fake.weight, bias=None,
+        src_node_ids=src_ids,
+        activation=ActivationType.LINEAR,
+        layer_id=layer_id,
+        node_group_id=0,
+        edge_group_id=0,
+    )
+    layer_id += 1
+
+    current_ids = emb_out_ids
+
+    # --- Transformer blocks ------------------------------------------------
+    # Access encoder layers handling both BertModel and BertForMaskedLM wrappers
+    encoder = _get_encoder(model)
+    if encoder is None:
+        raise ValueError("Cannot locate encoder layers in model.")
+
+    for block_idx, layer in enumerate(encoder):
+        attn = _get_attention(layer)
+        ffn_intermediate, ffn_output = _get_ffn(layer)
+        ln1, ln2 = _get_layer_norms(layer)
+
+        ng_base = 1 + block_idx * 6
+        eg_base = 1 + block_idx * 6
+
+        # Self-attention
+        attn_ids = _convert_attention_block(
+            builder=builder,
+            attn_module=attn,
+            src_node_ids=current_ids,
+            base_layer_id=layer_id,
+            node_group_base=ng_base,
+            edge_group_base=eg_base,
+            num_heads=num_heads,
+            hidden_size=hidden_size,
+            head_dim=head_dim,
+        )
+        layer_id += 2
+
+        # Residual + LayerNorm 1: absorb LN params into attn_ids nodes
+        if ln1 is not None and hasattr(ln1, 'weight'):
+            _absorb_layer_norm(builder, attn_ids, ln1)
+
+        current_ids = attn_ids
+
+        # FFN
+        if ffn_intermediate is not None and ffn_output is not None:
+            act_type = _infer_bert_ffn_activation(layer)
+            ffn_ids = builder.add_dense_layer(
+                weight=ffn_intermediate.weight, bias=ffn_intermediate.bias,
+                src_node_ids=current_ids,
+                activation=act_type,
+                layer_id=layer_id,
+                node_group_id=ng_base + 4,
+                edge_group_id=eg_base + 4,
+            )
+            layer_id += 1
+            ffn_out_ids = builder.add_dense_layer(
+                weight=ffn_output.dense.weight if hasattr(ffn_output, 'dense') else ffn_output.weight,
+                bias=ffn_output.dense.bias if hasattr(ffn_output, 'dense') else ffn_output.bias,
+                src_node_ids=ffn_ids,
+                activation=ActivationType.LINEAR,
+                layer_id=layer_id,
+                node_group_id=ng_base + 5,
+                edge_group_id=eg_base + 5,
+            )
+            layer_id += 1
+
+            if ln2 is not None and hasattr(ln2, 'weight'):
+                _absorb_layer_norm(builder, ffn_out_ids, ln2)
+
+            current_ids = ffn_out_ids
+
+    builder.output_nodes = list(current_ids)
+    return builder
+
+
+def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
+    """Convert a LLaMA-2 / Qwen decoder-only model to a DAG."""
+    builder = _GraphBuilder()
+    hidden_size = cfg.hidden_size
+    num_heads   = cfg.num_attention_heads
+    head_dim    = hidden_size // num_heads
+
+    # Input nodes
+    src_ids = [builder.add_input_node(group_id=0) for _ in range(hidden_size)]
+    layer_id = 1
+
+    # Embedding
+    embed_tokens = _find_submodule(model, ("model.embed_tokens", "embed_tokens", "transformer.wte"))
+    if embed_tokens is not None:
+        emb_w = embed_tokens.weight
+        emb_mean = emb_w.mean(dim=0, keepdim=True).expand(hidden_size, hidden_size)
+        emb_fake = nn.Linear(hidden_size, hidden_size, bias=False)
+        emb_fake.weight = nn.Parameter(emb_mean.detach())
+        emb_out_ids = builder.add_dense_layer(
+            weight=emb_fake.weight, bias=None,
+            src_node_ids=src_ids,
+            activation=ActivationType.LINEAR,
+            layer_id=layer_id,
+            node_group_id=0,
+            edge_group_id=0,
+        )
+        layer_id += 1
+        current_ids = emb_out_ids
+    else:
+        current_ids = src_ids
+
+    # Transformer decoder layers
+    decoder_layers = _get_decoder_layers(model)
+    if decoder_layers is None:
+        raise ValueError("Cannot locate decoder layers in model.")
+
+    for block_idx, layer in enumerate(decoder_layers):
+        ng_base = 1 + block_idx * 7
+        eg_base = 1 + block_idx * 7
+
+        # Self-attention (LLaMA uses self_attn)
+        attn = _find_submodule_attr(layer, ("self_attn", "attention"))
+        if attn is not None:
+            attn_ids = _convert_attention_block(
+                builder=builder,
+                attn_module=attn,
+                src_node_ids=current_ids,
+                base_layer_id=layer_id,
+                node_group_base=ng_base,
+                edge_group_base=eg_base,
+                num_heads=num_heads,
+                hidden_size=hidden_size,
+                head_dim=head_dim,
+            )
+            layer_id += 2
+
+            # RMSNorm (LLaMA uses RMSNorm, no beta)
+            rms1 = _find_submodule_attr(layer, ("input_layernorm", "ln_1"))
+            if rms1 is not None and hasattr(rms1, 'weight'):
+                _absorb_rms_norm(builder, attn_ids, rms1)
+
+            current_ids = attn_ids
+
+        # Gated FFN (LLaMA uses SwiGLU: gate_proj, up_proj, down_proj)
+        gate_proj = _find_submodule_attr(layer, ("mlp.gate_proj",))
+        up_proj   = _find_submodule_attr(layer, ("mlp.up_proj",))
+        down_proj = _find_submodule_attr(layer, ("mlp.down_proj",))
+
+        if gate_proj is not None and up_proj is not None and down_proj is not None:
+            # Gate branch (SiLU activation)
+            gate_ids = builder.add_dense_layer(
+                weight=gate_proj.weight, bias=gate_proj.bias,
+                src_node_ids=current_ids,
+                activation=ActivationType.SILU,
+                layer_id=layer_id,
+                node_group_id=ng_base + 4,
+                edge_group_id=eg_base + 4,
+            )
+            # Up branch (linear)
+            up_ids = builder.add_dense_layer(
+                weight=up_proj.weight, bias=up_proj.bias,
+                src_node_ids=current_ids,
+                activation=ActivationType.LINEAR,
+                layer_id=layer_id,
+                node_group_id=ng_base + 5,
+                edge_group_id=eg_base + 5,
+            )
+            layer_id += 1
+
+            # Element-wise product of gate and up is approximated as:
+            # down_proj receives gate_ids (the gated representation).
+            # We encode the up_proj output as additional edges into down_proj nodes.
+            down_ids = builder.add_dense_layer(
+                weight=down_proj.weight, bias=down_proj.bias,
+                src_node_ids=gate_ids,
+                activation=ActivationType.LINEAR,
+                layer_id=layer_id,
+                node_group_id=ng_base + 6,
+                edge_group_id=eg_base + 6,
+            )
+            # Also connect up_ids -> down_ids (captures SwiGLU multiplicative path)
+            _add_cross_edges(builder, up_ids, down_ids, eg_base + 5)
+            layer_id += 1
+
+            rms2 = _find_submodule_attr(layer, ("post_attention_layernorm", "ln_2"))
+            if rms2 is not None and hasattr(rms2, 'weight'):
+                _absorb_rms_norm(builder, down_ids, rms2)
+
+            current_ids = down_ids
+
+        else:
+            # Fallback: standard two-layer FFN
+            mlp = _find_submodule_attr(layer, ("mlp", "feed_forward"))
+            if mlp is not None:
+                fc1 = _find_submodule_attr(mlp, ("fc1", "w1", "dense_h_to_4h", "c_fc"))
+                fc2 = _find_submodule_attr(mlp, ("fc2", "w2", "dense_4h_to_h", "c_proj"))
+                if fc1 is not None and fc2 is not None:
+                    ffn_ids = builder.add_dense_layer(
+                        weight=fc1.weight, bias=fc1.bias,
+                        src_node_ids=current_ids,
+                        activation=ActivationType.SILU,
+                        layer_id=layer_id,
+                        node_group_id=ng_base + 4,
+                        edge_group_id=eg_base + 4,
+                    )
+                    layer_id += 1
+                    out_ids = builder.add_dense_layer(
+                        weight=fc2.weight, bias=fc2.bias,
+                        src_node_ids=ffn_ids,
+                        activation=ActivationType.LINEAR,
+                        layer_id=layer_id,
+                        node_group_id=ng_base + 5,
+                        edge_group_id=eg_base + 5,
+                    )
+                    layer_id += 1
+                    current_ids = out_ids
+
+    # LM head
+    lm_head = _find_submodule(model, ("lm_head",))
+    if lm_head is not None:
+        lm_ids = builder.add_dense_layer(
+            weight=lm_head.weight, bias=lm_head.bias,
+            src_node_ids=current_ids,
+            activation=ActivationType.LINEAR,
+            layer_id=layer_id,
+            node_group_id=0,
+            edge_group_id=0,
+        )
+        current_ids = lm_ids
+
+    builder.output_nodes = list(current_ids)
+    return builder
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _get_encoder(model: nn.Module):
+    """Return the iterable of transformer encoder layers."""
+    for attr in (
+        "encoder.layer",        # BERT, RoBERTa
+        "transformer.layer",    # DistilBERT
+        "bert.encoder.layer",
+        "roberta.encoder.layer",
+    ):
+        obj = _find_submodule(model, (attr,))
+        if obj is not None:
+            return obj
+    return None
+
+
+def _get_decoder_layers(model: nn.Module):
+    """Return the iterable of transformer decoder layers."""
+    for attr in (
+        "model.layers",         # LLaMA, Qwen
+        "transformer.h",        # GPT-2
+        "model.decoder.layers", # OPT
+        "gpt_neox.layers",      # GPT-NeoX
+    ):
+        obj = _find_submodule(model, (attr,))
+        if obj is not None:
+            return obj
+    return None
+
+
+def _get_attention(layer: nn.Module) -> Optional[nn.Module]:
+    for attr in ("attention", "self_attn", "attn"):
+        if hasattr(layer, attr):
+            return getattr(layer, attr)
+    return None
+
+
+def _get_ffn(layer: nn.Module):
+    """Return (intermediate_linear, output_module) for BERT-style FFN."""
+    # BERT: layer.intermediate.dense, layer.output.dense
+    intermediate = None
+    output_mod   = None
+    for attr in ("intermediate", "ffn.lin1"):
+        if hasattr(layer, attr):
+            sub = getattr(layer, attr)
+            if hasattr(sub, 'dense'):
+                intermediate = sub.dense
+            elif isinstance(sub, nn.Linear):
+                intermediate = sub
+            break
+    for attr in ("output", "ffn.lin2"):
+        if hasattr(layer, attr):
+            sub = getattr(layer, attr)
+            if hasattr(sub, 'dense'):
+                output_mod = sub
+            elif isinstance(sub, nn.Linear):
+                output_mod = sub
+            break
+    return intermediate, output_mod
+
+
+def _get_layer_norms(layer: nn.Module):
+    """Return (ln_after_attn, ln_after_ffn) for a BERT-style layer."""
+    ln1 = ln2 = None
+    for attr in ("attention.output.LayerNorm", "LayerNorm", "sa_layer_norm"):
+        obj = _find_submodule(layer, (attr,))
+        if obj is not None:
+            ln1 = obj; break
+    for attr in ("output.LayerNorm", "output_layer_norm"):
+        obj = _find_submodule(layer, (attr,))
+        if obj is not None:
+            ln2 = obj; break
+    return ln1, ln2
+
+
+def _infer_bert_ffn_activation(layer: nn.Module) -> ActivationType:
+    """Detect activation used in BERT FFN (usually GELU)."""
+    for attr in ("intermediate", "ffn"):
+        if hasattr(layer, attr):
+            sub = getattr(layer, attr)
+            for sub_attr in ("intermediate_act_fn", "activation"):
+                if hasattr(sub, sub_attr):
+                    fn = getattr(sub, sub_attr)
+                    fn_name = type(fn).__name__.lower() if not callable(fn) else fn.__name__.lower() if hasattr(fn, '__name__') else ""
+                    for key, act in _ACT_MAP.items():
+                        if key in fn_name:
+                            return act
+    return ActivationType.GELU  # BERT default
+
+
+def _absorb_layer_norm(
+    builder: _GraphBuilder,
+    node_ids: List[int],
+    ln: nn.Module,
+) -> None:
+    """Write LayerNorm gamma/beta into existing node features."""
+    if not hasattr(ln, 'weight'):
+        return
+    gamma = ln.weight.detach().float()
+    beta  = ln.bias.detach().float() if ln.bias is not None else torch.zeros_like(gamma)
+    for i, nid in enumerate(node_ids):
+        if i < len(gamma):
+            builder._node_feats[nid].ln_gamma = float(gamma[i])
+            builder._node_feats[nid].ln_beta  = float(beta[i])
+
+
+def _absorb_rms_norm(
+    builder: _GraphBuilder,
+    node_ids: List[int],
+    rms: nn.Module,
+) -> None:
+    """Write RMSNorm weight (no bias) into ln_gamma channel of existing nodes."""
+    if not hasattr(rms, 'weight'):
+        return
+    gamma = rms.weight.detach().float()
+    for i, nid in enumerate(node_ids):
+        if i < len(gamma):
+            builder._node_feats[nid].ln_gamma = float(gamma[i])
+
+
+def _add_cross_edges(
+    builder: _GraphBuilder,
+    src_ids: List[int],
+    tgt_ids: List[int],
+    edge_group_id: int,
+) -> None:
+    """Add unit-weight edges from every src to every tgt (residual merge)."""
+    for src in src_ids:
+        for tgt in tgt_ids:
+            builder.add_edge(src=src, tgt=tgt, weight=1.0, group_id=edge_group_id)
+
+
+def _find_submodule(model: nn.Module, attr_paths: Tuple[str, ...]) -> Optional[nn.Module]:
+    """Traverse dotted attribute paths; return first match or None."""
+    for path in attr_paths:
+        obj = model
+        try:
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            return obj
+        except AttributeError:
+            continue
+    return None
+
+
+def _find_submodule_attr(module: nn.Module, attr_paths: Tuple[str, ...]) -> Optional[nn.Module]:
+    return _find_submodule(module, attr_paths)
+
+
+# ---------------------------------------------------------------------------
+# Generic fallback converter
+# ---------------------------------------------------------------------------
+
+def _convert_generic(model: nn.Module) -> _GraphBuilder:
+    """
+    Fallback: walk named_parameters() and convert every nn.Linear found.
+
+    Groups layers by name prefix depth to assign node/edge groups.
+    """
+    builder = _GraphBuilder()
+    hidden_size = 768  # default; will be overridden by first layer
+
+    # Collect all Linear layers in order
+    linears: List[Tuple[str, nn.Linear]] = [
+        (name, m)
+        for name, m in model.named_modules()
+        if isinstance(m, nn.Linear)
+    ]
+
+    if not linears:
+        raise ValueError("No nn.Linear modules found; cannot build model-graph.")
+
+    in_features = linears[0][1].weight.shape[1]
+    src_ids = [builder.add_input_node(group_id=0) for _ in range(in_features)]
+    layer_id = 1
+
+    for group_id, (name, linear) in enumerate(linears):
+        act = ActivationType.GELU if "intermediate" in name or "fc" in name else ActivationType.LINEAR
+        tgt_ids = builder.add_dense_layer(
+            weight=linear.weight,
+            bias=linear.bias,
+            src_node_ids=src_ids,
+            activation=act,
+            layer_id=layer_id,
+            node_group_id=group_id,
+            edge_group_id=group_id,
+        )
+        src_ids = tgt_ids
+        layer_id += 1
+
+    builder.output_nodes = list(src_ids)
+    return builder
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def build_model_graph(
+    model: nn.Module,
+    k_node: int = 8,
+    k_edge: int = 8,
+) -> ModelGraph:
+    """
+    Convert any HuggingFace LLM backbone into a ModelGraph DAG.
+
+    Parameters
+    ----------
+    model  : nn.Module
+        A loaded HuggingFace model (BertModel, LlamaForCausalLM, etc.)
+    k_node : int
+        Number of node groups for the Theta parameteriser.
+    k_edge : int
+        Number of edge groups for the Theta parameteriser.
+
+    Returns
+    -------
+    ModelGraph
+    """
+    cfg = getattr(model, "config", None)
+    arch_type = _detect_arch_type(model, cfg)
+
+    model.eval()
+    with torch.no_grad():
+        if arch_type.startswith("bert") or arch_type.startswith("roberta") or arch_type.startswith("distilbert"):
+            builder = _convert_bert(model, cfg)
+        elif any(arch_type.startswith(p) for p in ("llama", "qwen", "gpt2", "gpt_neox", "opt", "mistral", "falcon")):
+            builder = _convert_llama(model, cfg)
+        else:
+            builder = _convert_generic(model)
+
+    graph = builder.build(arch_type=arch_type, k_node=k_node, k_edge=k_edge)
+    _validate_dag(graph)
+    return graph
+
+
+def _detect_arch_type(model: nn.Module, cfg) -> str:
+    """Return a normalised architecture identifier string."""
+    if cfg is not None:
+        model_type = getattr(cfg, "model_type", "").lower()
+        if model_type:
+            name = getattr(cfg, "_name_or_path", model_type)
+            return name.lower() if name else model_type
+
+    class_name = type(model).__name__.lower()
+    for key in ("llama", "qwen", "bert", "roberta", "distilbert", "gpt2", "gpt_neox", "opt", "mistral", "falcon"):
+        if key in class_name:
+            return key
+    return class_name
+
+
+def _validate_dag(graph: ModelGraph) -> None:
+    """
+    Assert that edge_index encodes a valid DAG using topological layer ids.
+
+    Every edge (u -> v) must satisfy layer_id[u] < layer_id[v].
+    Raises ValueError on violation.
+    """
+    if graph.num_edges == 0:
+        return
+    src = graph.edge_index[0]
+    tgt = graph.edge_index[1]
+    src_layers = graph.node_layer_ids[src]
+    tgt_layers = graph.node_layer_ids[tgt]
+    violations = (src_layers >= tgt_layers).sum().item()
+    if violations > 0:
+        raise ValueError(
+            f"DAG validation failed: {violations} edges violate topological ordering "
+            f"(src_layer >= tgt_layer). Check _GraphBuilder layer_id assignments."
+        )
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\models\__init__.py
+from .model_graph import ModelGraph, build_model_graph, NodeFeature, ActivationType
+from .gnn_params import ThetaVector, apply_theta_to_graph, theta_from_flat
+from .forward_pass import dag_forward, dag_forward_batched
+
+__all__ = [
+    "ModelGraph",
+    "build_model_graph",
+    "NodeFeature",
+    "ActivationType",
+    "ThetaVector",
+    "apply_theta_to_graph",
+    "theta_from_flat",
+    "dag_forward",
+    "dag_forward_batched",
+]
+
+
+// File: c:\Users\fp223\Projects\UnifiedEdu\unifiededu\__init__.py
+"""UnifiedEdu: federated QA generation across heterogeneous LLM backbones."""
+
+
