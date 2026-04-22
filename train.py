@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 log = logging.getLogger(__name__)

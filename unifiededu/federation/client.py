@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 from torch.optim import AdamW
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 log = logging.getLogger(__name__)
@@ -263,10 +263,10 @@ class FederationClient:
 
                 # The pbar is now closed. Logging is safe and won't cause line-breaks.
                 avg = epoch_loss / max(n_batches, 1)
-                # log.info(
-                #     "C%d(%s) ep%d/%d  avg_loss=%.4f",
-                #     self.client_id, self.model_name, epoch + 1, local_eps, avg,
-                # )
+                log.info(
+                    "C%d(%s) ep%d/%d  avg_loss=%.4f",
+                    self.client_id, self.model_name, epoch + 1, local_eps, avg,
+                )
 
         return theta.theta.detach().clone()
 
