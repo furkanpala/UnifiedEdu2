@@ -220,53 +220,53 @@ class FederationClient:
         optimizer.zero_grad()
 
         # redirect_tqdm ensures log messages don't break the progress bar formatting
-        with logging_redirect_tqdm():
-            for epoch in range(local_eps):
-                pending    = 0
-                epoch_loss = 0.0
-                n_batches  = 0
-                ep_label   = f"C{self.client_id}({self.model_name}) Ep {epoch+1}/{local_eps}"
+        # with logging_redirect_tqdm(tqdm_class=tqdm):
+        for epoch in range(local_eps):
+            pending    = 0
+            epoch_loss = 0.0
+            n_batches  = 0
+            ep_label   = f"C{self.client_id}({self.model_name}) Ep {epoch+1}/{local_eps}"
+            
+            # Using 'with' ensures pbar.close() is called before we log at the end of the epoch
+            with tqdm(
+                self.dataloader, 
+                desc=ep_label, 
+                leave=False, 
+                unit="batch", 
+                dynamic_ncols=True
+            ) as pbar:
                 
-                # Using 'with' ensures pbar.close() is called before we log at the end of the epoch
-                with tqdm(
-                    self.dataloader, 
-                    desc=ep_label, 
-                    leave=False, 
-                    unit="batch", 
-                    dynamic_ncols=True
-                ) as pbar:
+                for batch in pbar:
+                    loss = self._compute_loss(batch, theta)
+                    (loss / accum).backward()
                     
-                    for batch in pbar:
-                        loss = self._compute_loss(batch, theta)
-                        (loss / accum).backward()
-                        
-                        pending    += 1
-                        current_val = loss.item()
-                        epoch_loss += current_val
-                        n_batches  += 1
+                    pending    += 1
+                    current_val = loss.item()
+                    epoch_loss += current_val
+                    n_batches  += 1
 
-                        if pending == accum:
-                            torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
-                            optimizer.step()
-                            optimizer.zero_grad()
-                            pending = 0
-                        
-                        # Optional: Update the bar with the latest loss
-                        if n_batches % 5 == 0:
-                            pbar.set_postfix(loss=f"{current_val:.4f}")
-
-                    # Flush remaining gradients at end of epoch
-                    if pending > 0:
+                    if pending == accum:
                         torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                         optimizer.step()
                         optimizer.zero_grad()
+                        pending = 0
+                    
+                    # Optional: Update the bar with the latest loss
+                    if n_batches % 5 == 0:
+                        pbar.set_postfix(loss=f"{current_val:.4f}")
 
-                # The pbar is now closed. Logging is safe and won't cause line-breaks.
-                avg = epoch_loss / max(n_batches, 1)
-                log.info(
-                    "C%d(%s) ep%d/%d  avg_loss=%.4f",
-                    self.client_id, self.model_name, epoch + 1, local_eps, avg,
-                )
+                # Flush remaining gradients at end of epoch
+                if pending > 0:
+                    torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+            # The pbar is now closed. Logging is safe and won't cause line-breaks.
+            avg = epoch_loss / max(n_batches, 1)
+            log.info(
+                "C%d(%s) ep%d/%d  avg_loss=%.4f",
+                self.client_id, self.model_name, epoch + 1, local_eps, avg,
+            )
 
         return theta.theta.detach().clone()
 
