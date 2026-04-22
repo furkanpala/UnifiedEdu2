@@ -183,7 +183,7 @@ class FederationServer:
         # ----------------------------------------------------------
         # Stage 3: dynamic re-clustering
         # ----------------------------------------------------------
-        max_k = self.cfg.effective_max_clusters()
+        max_k = self.cfg.effective_max_clusters(num_clients=self.num_clients)
         if self._cluster_result is None or round_num % self.cfg.t_update == 0:
             self._cluster_result = cluster_thetas(theta_matrix, max_clusters=max_k)
             log.info(
@@ -306,7 +306,7 @@ class StaticFederationServer(FederationServer):
     def _init_static_clustering(self) -> None:
         """Cluster once using topology feature vectors."""
         feats  = torch.stack([_topology_features(g) for g in self._graphs])  # (m, F)
-        max_k  = self.cfg.effective_max_clusters()
+        max_k  = self.cfg.effective_max_clusters(num_clients=self.num_clients)
         result = cluster_thetas(feats, max_clusters=max_k)
         self._fixed_cluster = result
         log.info(

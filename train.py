@@ -54,9 +54,30 @@ log = logging.getLogger(__name__)
 # Lazy imports (avoid loading HuggingFace at module level)
 # ---------------------------------------------------------------------------
 
+_ENCODER_ONLY_MODEL_TYPES = {
+    "bert", "roberta", "distilbert", "albert", "electra", "deberta",
+    "deberta-v2", "xlm-roberta", "camembert",
+}
+
 def _load_hf_model(model_name: str, device: str):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     log.info("Loading model %s ...", model_name)
+
+    # Reject encoder-only models before downloading weights.
+    # BERT-family models use bidirectional attention and have no causal
+    # language modelling objective — they cannot generate text token-by-token.
+    # Use a decoder-only model such as distilgpt2, facebook/opt-125m, or
+    # EleutherAI/pythia-160m instead.
+    cfg_hf = AutoConfig.from_pretrained(model_name)
+    model_type = getattr(cfg_hf, "model_type", "").lower()
+    if model_type in _ENCODER_ONLY_MODEL_TYPES:
+        raise ValueError(
+            f"'{model_name}' (model_type='{model_type}') is an encoder-only model "
+            "and cannot generate text autoregressively. "
+            "Choose a decoder-only backbone, e.g. 'distilgpt2', "
+            "'facebook/opt-125m', or 'EleutherAI/pythia-160m'."
+        )
+
     tok   = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name)
     if tok.pad_token_id is None:
@@ -280,7 +301,7 @@ def run_individual(
                 round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
             for i, client in enumerate(clients):
                 q = client.generate_qa(thetas[i])
-                log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
+                log.info("Round %d  C%d(%s) sample QA: %s", t, i, client.model_name, q)
 
         _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
         if t % 10 == 0:
@@ -327,7 +348,7 @@ def _run_federated(
                 round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
             for i, client in enumerate(clients):
                 q = client.generate_qa(uploads[i])
-                log.info("Round %d  C%d(%s) sample question: %s", t, i, client.model_name, q)
+                log.info("Round %d  C%d(%s) sample QA: %s", t, i, client.model_name, q)
 
         _log_round(t, num_rounds, uploads, server.cluster_result,
                     time.time() - t0, log_path, val_losses)

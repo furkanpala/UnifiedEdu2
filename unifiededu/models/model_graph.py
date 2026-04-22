@@ -326,23 +326,25 @@ def _convert_attention_block(
       (b) Separate Q, K, V:  individual nn.Linear modules
           -- BERT, RoBERTa, LLaMA
     """
-    # Attempt to locate Q/K/V/O projections by common attribute names
+    # Attempt to locate Q/K/V/O projections by common attribute names.
+    # Covers: BERT/RoBERTa (query/key/value/dense), LLaMA (q_proj/k_proj/v_proj/o_proj),
+    #         DistilBERT (q_lin/k_lin/v_lin/out_lin), GPT-J/Falcon (q_proj+out_proj).
     q_proj = k_proj = v_proj = o_proj = None
     fused_qkv: Optional[nn.Linear] = None
 
-    for attr in ("q_proj", "query"):
+    for attr in ("q_proj", "query", "q_lin"):
         if hasattr(attn_module, attr):
             q_proj = getattr(attn_module, attr); break
 
-    for attr in ("k_proj", "key"):
+    for attr in ("k_proj", "key", "k_lin"):
         if hasattr(attn_module, attr):
             k_proj = getattr(attn_module, attr); break
 
-    for attr in ("v_proj", "value"):
+    for attr in ("v_proj", "value", "v_lin"):
         if hasattr(attn_module, attr):
             v_proj = getattr(attn_module, attr); break
 
-    for attr in ("o_proj", "out_proj", "dense"):
+    for attr in ("o_proj", "out_proj", "dense", "out_lin"):
         if hasattr(attn_module, attr):
             o_proj = getattr(attn_module, attr); break
 
@@ -416,13 +418,12 @@ def _convert_attention_block(
         edge_group_id=edge_group_base + 2,
     )
 
-    # Attention output: in the DAG we concatenate Q+K+V node streams
-    # into the output projection. For the graph model we treat the
-    # attended representation as V projected through O (simplification
-    # that preserves all learnable parameters).
+    # Output projection: primary data path is V -> O (actual weight used).
+    # Q and K also connect to O via sparse proxy edges (weight=1.0) so they
+    # are not dead-end subgraphs in the DAG.  This does not affect training
+    # (modulate_params uses named_modules(), not the DAG), but makes the
+    # topology representation structurally honest.
     if o_proj is not None:
-        # Output projection maps concatenated heads back to hidden_size.
-        # Conv1D weight needs transposing to (out, in) orientation.
         attn_out_ids = builder.add_dense_layer(
             weight=_get_linear_weight(o_proj), bias=o_proj.bias,
             src_node_ids=v_ids,
@@ -431,6 +432,11 @@ def _convert_attention_block(
             node_group_id=node_group_base + 3,
             edge_group_id=edge_group_base + 3,
         )
+        # Proxy edges Q -> O and K -> O (pairwise, weight=1.0, valid DAG order)
+        if len(q_ids) == len(attn_out_ids):
+            _add_residual_edges(builder, q_ids, attn_out_ids, edge_group_base + 4)
+        if len(k_ids) == len(attn_out_ids):
+            _add_residual_edges(builder, k_ids, attn_out_ids, edge_group_base + 5)
     else:
         attn_out_ids = v_ids
 
@@ -717,19 +723,11 @@ def _convert_llama(model: nn.Module, cfg) -> _GraphBuilder:
 
                     current_ids = out_ids
 
-    # LM head
-    lm_head = _find_submodule(model, ("lm_head",))
-    if lm_head is not None:
-        lm_ids = builder.add_dense_layer(
-            weight=lm_head.weight, bias=lm_head.bias,
-            src_node_ids=current_ids,
-            activation=ActivationType.LINEAR,
-            layer_id=layer_id,
-            node_group_id=0,
-            edge_group_id=0,
-        )
-        current_ids = lm_ids
-
+    # LM head is intentionally excluded from the DAG.  Its weight matrix is
+    # (vocab_size, hidden) — adding it creates O(vocab * hidden) edges (~38M
+    # for GPT-2) which makes the graph intractably large.  The lm_head is
+    # still modulated during training via modulate_params(), which walks
+    # named_modules() independently of the DAG.
     builder.output_nodes = list(current_ids)
     return builder
 

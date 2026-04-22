@@ -17,13 +17,25 @@ class FederationConfig:
     t_bc:         int   = 20    # inter-cluster aggregation interval
     T_init:       int   = 30    # warm-up rounds before inter-cluster agg
     t_update:     int   = 20    # re-clustering interval
-    num_clients:  int   = 4     # number of participating institutions
-    max_clusters: int   = -1    # -1 = floor(num_clients/2) auto
+    num_clients:  int   = 3     # number of participating institutions
+    max_clusters: int   = -1    # -1 = ceil(num_clients/2) auto
 
-    def effective_max_clusters(self) -> int:
+    def effective_max_clusters(self, num_clients: int = None) -> int:
+        """
+        Return the maximum number of clusters to consider.
+
+        Parameters
+        ----------
+        num_clients : int, optional
+            Actual number of clients this round.  Overrides the config field
+            when provided (the server passes self.num_clients here so the
+            value stays consistent with reality even if the config field is
+            left at its default).
+        """
+        nc = num_clients if num_clients is not None else self.num_clients
         if self.max_clusters > 0:
             return self.max_clusters
-        return max(1, self.num_clients // 2)
+        return max(1, (nc + 1) // 2)  # ceiling: 3 clients -> 2 max clusters
 
 
 @dataclass

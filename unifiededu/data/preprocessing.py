@@ -145,14 +145,15 @@ def _flatten_to_samples(records: List[dict], client_name: str) -> List[dict]:
             sid    = hashlib.md5(raw_id.encode("utf-8")).hexdigest()[:16]
 
             samples.append({
-                "sample_id":  sid,
-                "context":    ctx,
-                "question":   qa["question"],
-                "answer":     qa["answer"],
-                "difficulty": qa.get("difficulty", "unknown"),
+                "sample_id":   sid,
+                "input_index": rec["input_index"],   # kept for context-level splitting
+                "context":     ctx,
+                "question":    qa["question"],
+                "answer":      qa["answer"],
+                "difficulty":  qa.get("difficulty", "unknown"),
                 "bloom_level": bloom,
-                "metadata":   meta,
-                "embedding":  [],   # filled later by embed_samples()
+                "metadata":    meta,
+                "embedding":   [],   # filled later by embed_samples()
             })
     return samples
 
@@ -230,63 +231,78 @@ def _split_samples(
     rng:         random.Random,
 ) -> Tuple[List[dict], List[dict], List[dict]]:
     """
-    Split samples into train / val / test.
+    Split samples into train / val / test WITHOUT data leakage.
 
-    Anchor-topic guarantee:
-        For each of the 10 anchor topics, we try to include at least
-        min_anchor_chunks // 10 samples in the test set whose context
-        matches that topic's keywords.  If the dataset has too few
-        anchor hits, we include all matching samples in test and fill
-        the remainder with non-anchor samples.
+    Grouping is by input_index (one source context).  All QA pairs that
+    share the same input_index are assigned to the same partition so the
+    model cannot memorise a context during training and encounter it again
+    at test time.
+
+    Anchor-topic guarantee is applied at the context group level.
 
     Returns (train, val, test).
     """
-    test_ratio = 1.0 - train_ratio - val_ratio
-    n_test     = max(1, round(len(samples) * test_ratio))
-    n_val      = max(1, round(len(samples) * val_ratio))
-
-    # Separate anchor and non-anchor samples
-    anchor_map: Dict[str, List[dict]] = defaultdict(list)
+    # --- group samples by their source context (input_index) ---------------
+    ctx_groups: Dict[int, List[dict]] = defaultdict(list)
     for s in samples:
-        for topic in _anchor_hits(s["context"] + " " + s["question"]):
-            anchor_map[topic].append(s)
+        ctx_groups[s["input_index"]].append(s)
 
-    # Guarantee at least one sample per anchor topic in test (if available)
-    test_set:   List[dict] = []
-    used_ids = set()
+    ctx_ids = list(ctx_groups.keys())
+    n_total = len(ctx_ids)
+    test_ratio = 1.0 - train_ratio - val_ratio
+    n_test = max(1, round(n_total * test_ratio))
+    n_val  = max(1, round(n_total * val_ratio))
 
+    # --- anchor-topic detection at context level ---------------------------
+    anchor_map: Dict[str, List[int]] = defaultdict(list)
+    for cid, ctx_samples in ctx_groups.items():
+        all_text = (ctx_samples[0]["context"] + " " +
+                    " ".join(s["question"] for s in ctx_samples))
+        for topic in _anchor_hits(all_text):
+            anchor_map[topic].append(cid)
+
+    # --- build test set: anchor contexts first -----------------------------
+    test_ctx_ids: List[int] = []
+    used_ctx_ids: set = set()
     per_topic_target = max(1, min_anchor_chunks // len(ANCHOR_TOPICS))
+
     for topic_key, _ in ANCHOR_TOPICS:
-        candidates = [s for s in anchor_map.get(topic_key, [])
-                      if s["sample_id"] not in used_ids]
+        candidates = [c for c in anchor_map.get(topic_key, [])
+                      if c not in used_ctx_ids]
         rng.shuffle(candidates)
-        chosen = candidates[:per_topic_target]
-        for s in chosen:
-            used_ids.add(s["sample_id"])
-        test_set.extend(chosen)
+        for c in candidates[:per_topic_target]:
+            used_ctx_ids.add(c)
+            test_ctx_ids.append(c)
 
-    # Fill remainder of test from non-anchor samples
-    non_anchor = [s for s in samples if s["sample_id"] not in used_ids]
+    # fill remainder of test with non-anchor contexts
+    non_anchor = [c for c in ctx_ids if c not in used_ctx_ids]
     rng.shuffle(non_anchor)
-    still_needed = max(0, n_test - len(test_set))
+    still_needed = max(0, n_test - len(test_ctx_ids))
     extra = non_anchor[:still_needed]
-    test_set.extend(extra)
-    used_ids.update(s["sample_id"] for s in extra)
+    test_ctx_ids.extend(extra)
+    used_ctx_ids.update(extra)
 
-    # Everything not in test is available for train / val
-    remaining = [s for s in samples if s["sample_id"] not in used_ids]
+    # --- val / train from the remaining contexts ---------------------------
+    remaining = [c for c in ctx_ids if c not in used_ctx_ids]
     rng.shuffle(remaining)
+    val_ctx_ids   = remaining[:n_val]
+    train_ctx_ids = remaining[n_val:]
 
-    val_set   = remaining[:n_val]
-    train_set = remaining[n_val:]
+    # --- expand context ids back to individual samples ---------------------
+    def _expand(ids: List[int]) -> List[dict]:
+        out: List[dict] = []
+        for cid in ids:
+            out.extend(ctx_groups[cid])
+        return out
+
+    train_set = _expand(train_ctx_ids)
+    val_set   = _expand(val_ctx_ids)
+    test_set  = _expand(test_ctx_ids)
 
     log.info(
-        "Split: train=%d val=%d test=%d | anchor topics covered: %d/10",
+        "Split: train=%d val=%d test=%d  (from %d/%d/%d contexts)",
         len(train_set), len(val_set), len(test_set),
-        sum(1 for tk, _ in ANCHOR_TOPICS if any(
-            _anchor_hits(s["context"] + s["question"])
-            for s in test_set if tk in _anchor_hits(s["context"] + s["question"])
-        )),
+        len(train_ctx_ids), len(val_ctx_ids), len(test_ctx_ids),
     )
     return train_set, val_set, test_set
 

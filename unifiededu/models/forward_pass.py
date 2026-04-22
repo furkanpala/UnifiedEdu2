@@ -138,6 +138,25 @@ def dag_forward_batched(
         if i < n_in:
             H[:, nid, :] = input_features[:, i, :]
 
+    # Apply bias / activation / LayerNorm to layer-0 (input) nodes so this
+    # function is consistent with the sequential dag_forward implementation.
+    layer0_ids = (layer_ids == 0).nonzero(as_tuple=True)[0]
+    if layer0_ids.numel() > 0:
+        biases    = node_feats[layer0_ids, 0]        # (n0,)
+        act_codes = node_feats[layer0_ids, 1].long() # (n0,)
+        H[:, layer0_ids, :] += biases.unsqueeze(0).unsqueeze(-1)
+        for i, nid in enumerate(layer0_ids.tolist()):
+            act_fn = _ACT_FN.get(int(act_codes[i].item()), lambda x: x)
+            H[:, nid, :] = act_fn(H[:, nid, :])
+        gammas = node_feats[layer0_ids, 2]
+        betas  = node_feats[layer0_ids, 3]
+        ln_mask = gammas.abs() > 0
+        if ln_mask.any():
+            ln_ids = layer0_ids[ln_mask]
+            g = gammas[ln_mask].to(device).unsqueeze(0).unsqueeze(-1)
+            b = betas[ln_mask].to(device).unsqueeze(0).unsqueeze(-1)
+            H[:, ln_ids, :] = H[:, ln_ids, :] * g + b
+
     # Group edges by target topological layer for efficient scatter
     layer_ids = graph.node_layer_ids          # (N,)
     max_layer  = int(layer_ids.max().item())

@@ -288,10 +288,12 @@ class FederationClient:
                     named_params[pname].data.copy_(val)
 
             try:
-                q_prompt = f"Context: {self.sample_context}\nQuestion:"
+                # Prompts match the training format exactly:
+                # prefix = "Context: {ctx}\n\nQuestion: ", completion = "{q}\nAnswer: {a}"
+                q_prompt = f"Context: {self.sample_context}\n\nQuestion: "
                 question = self._run_generate(q_prompt, max_new_tokens)
 
-                a_prompt = f"Context: {self.sample_context}\nQuestion: {question}\nAnswer:"
+                a_prompt = f"Context: {self.sample_context}\n\nQuestion: {question}\nAnswer: "
                 answer   = self._run_generate(a_prompt, max_new_tokens)
             finally:
                 for pname, orig in originals.items():
