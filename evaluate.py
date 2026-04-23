@@ -37,62 +37,59 @@ def _load_model_and_tokenizer(model_name: str, device: str):
 def _generate_qa_pairs(
     model,
     tokenizer,
-    samples:     List[dict],
-    theta_flat: torch.Tensor,
-    k_edge:     int,
-    k_node:     int,
-    device:     str,
-    max_new_tokens: int = 128,
+    samples:        List[dict],
+    theta_flat:     torch.Tensor,
+    k_edge:         int,
+    k_node:         int,
+    device:         str,
+    max_new_tokens: int = 80,
 ) -> List[Dict[str, str]]:
     from unifiededu.federation.client import assign_layer_groups, modulate_params
     from unifiededu.models.gnn_params import theta_from_flat
 
-    # 1. Instantiate Theta and modulate params
     theta  = theta_from_flat(theta_flat.to(device), k_edge, k_node)
     groups = assign_layer_groups(model, k_edge, k_node)
     params = modulate_params(model, theta, groups)
 
-    # 2. Swap the modulated parameters into the model temporarily
-    orig_state = {k: v.clone() for k, v in model.state_dict().items() if k in params}
-    model.load_state_dict(params, strict=False)
+    named_params = dict(model.named_parameters())
+    orig_state   = {k: v.data.clone() for k, v in named_params.items() if k in params}
+    for pname, val in params.items():
+        if pname in named_params:
+            named_params[pname].data.copy_(val)
+
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+
+    def _gen(prompt: str) -> str:
+        enc = tokenizer(prompt, return_tensors="pt", max_length=900, truncation=True).to(device)
+        with torch.no_grad():
+            out = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+                repetition_penalty=1.3,
+                no_repeat_ngram_size=3,
+                pad_token_id=pad_id,
+            )
+        new_ids = out[0][enc["input_ids"].shape[1]:]
+        return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
     results = []
-    
     try:
         for s in samples:
-            prompt = f"Context: {s['context']}\n\nQuestion: "
-            inputs = tokenizer(
-                prompt,
-                return_tensors="pt",
-                max_length=400,
-                truncation=True,
-            ).to(device)
-
-            with torch.no_grad():
-                # Now model.generate uses the Theta-modulated weights
-                gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-
-            generated = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-            
-            if "Answer:" in generated:
-                parts = generated.split("Answer:", 1)
-                q_part = parts[0].replace("Question:", "").strip()
-                a_part = parts[1].strip()
-            else:
-                q_part = generated.strip()
-                a_part = ""
-
+            question = _gen(f"Context: {s['context']}\n\nQuestion:")
+            answer   = _gen(f"Context: {s['context']}\n\nQuestion: {question}\nAnswer:")
             results.append({
-                "sample_id": s["sample_id"],
-                "context":   s["context"],
-                "question":  q_part,
-                "answer":    a_part,
+                "sample_id":    s["sample_id"],
+                "context":      s["context"],
+                "question":     question,
+                "answer":       answer,
                 "ref_question": s["question"],
                 "ref_answer":   s["answer"],
             })
     finally:
-        # 3. Restore the original frozen weights so we don't leak state
-        model.load_state_dict(orig_state, strict=False)
+        for pname, orig in orig_state.items():
+            named_params[pname].data.copy_(orig)
 
     return results
 

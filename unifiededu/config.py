@@ -6,8 +6,8 @@ from typing import List
 
 @dataclass
 class ModelGraphConfig:
-    k_node: int = 8   # node groups for Theta
-    k_edge: int = 8   # edge groups for Theta
+    k_node: int = 32   # node groups for Theta
+    k_edge: int = 32   # edge groups for Theta
 
 
 @dataclass
@@ -47,7 +47,7 @@ class TrainingConfig:
     batch_size:                  int   = 8
     local_epochs:                int   = 1     # local SGD epochs per round (E in FedAvg)
     gradient_accumulation_steps: int   = 4
-    max_seq_len:                 int   = 512
+    max_seq_len:                 int   = 1024
     chunk_stride:                int   = 128
 
 
