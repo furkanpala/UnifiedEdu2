@@ -48,7 +48,10 @@ def _generate(model, tokenizer, prompt: str, max_new_tokens: int, device: str) -
         out = model.generate(
             **enc,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
+            do_sample=True,
+            temperature=0.7,
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
             pad_token_id=pad_id,
         )
     new_ids = out[0][enc["input_ids"].shape[1]:]
@@ -58,7 +61,7 @@ def _generate(model, tokenizer, prompt: str, max_new_tokens: int, device: str) -
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model",          default="distilgpt2")
-    p.add_argument("--steps",          type=int,   default=300)
+    p.add_argument("--steps",          type=int,   default=600)
     p.add_argument("--lr",             type=float, default=5e-3)
     p.add_argument("--k",              type=int,   default=32,
                    help="k_edge = k_node = k (Theta groups)")
