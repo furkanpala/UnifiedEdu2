@@ -195,6 +195,10 @@ def _make_client(
         tokenizer=tokenizer,
         sample_context=sample_context,
         device=device,
+        lora_rank=cfg.model_graph.lora_rank,
+        lora_alpha=cfg.model_graph.lora_alpha,
+        use_gnn_theta=cfg.model_graph.use_gnn_theta,
+        gnn_hidden_dim=cfg.model_graph.gnn_hidden_dim,
     )
 
 
@@ -270,8 +274,7 @@ def _log_round(
 # ---------------------------------------------------------------------------
 
 def run_individual(
-    clients: list,
-    cfg,
+    clients:    list,
     output_dir: str,
     num_rounds: int,
 ) -> Dict[int, torch.Tensor]:
@@ -279,12 +282,9 @@ def run_individual(
     Each client trains in isolation for num_rounds epochs.
     No Theta sharing.  Returns final per-client Theta vectors.
     """
-    from unifiededu.models.gnn_params import ThetaVector
-
-    log_path  = os.path.join(output_dir, "train_log.jsonl")
-    thetas    = {i: ThetaVector(cfg.model_graph.k_edge, cfg.model_graph.k_node
-                                ).theta.detach().clone()
-                 for i in range(len(clients))}
+    log_path = os.path.join(output_dir, "train_log.jsonl")
+    # Round-1 init: None signals each client to create a fresh Theta
+    thetas: Dict[int, Optional[torch.Tensor]] = {i: None for i in range(len(clients))}
 
     # with logging_redirect_tqdm(tqdm_class=tqdm):
     round_pbar = tqdm(range(1, num_rounds + 1), desc="individual", unit="round")
@@ -517,7 +517,7 @@ def main():
     log.info("Starting %s training for %d rounds ...", args.method, T)
 
     if args.method == "individual":
-        final_thetas = run_individual(clients, cfg, args.output_dir, T)
+        final_thetas = run_individual(clients, args.output_dir, T)
     elif args.method == "fedavg":
         final_thetas = run_fedavg(clients, cfg, args.output_dir, T)
     elif args.method == "static":

@@ -44,12 +44,20 @@ def _generate_qa_pairs(
     device:         str,
     max_new_tokens: int = 80,
 ) -> List[Dict[str, str]]:
-    from unifiededu.federation.client import assign_layer_groups, modulate_params, _functional_generate
+    from unifiededu.federation.client import (
+        assign_layer_groups, get_layer_shapes, modulate_params, _functional_generate,
+    )
     from unifiededu.models.gnn_params import theta_from_flat
+    from unifiededu.config import UnifiedEduConfig
+    _cfg = UnifiedEduConfig()
 
-    theta  = theta_from_flat(theta_flat.to(device), k_edge, k_node)
+    groups       = assign_layer_groups(model, k_edge, k_node)
+    layer_shapes = get_layer_shapes(model, groups)
+    theta        = theta_from_flat(
+        theta_flat.to(device), layer_shapes,
+        _cfg.model_graph.lora_rank, _cfg.model_graph.lora_alpha,
+    )
     theta.eval()
-    groups = assign_layer_groups(model, k_edge, k_node)
     params = modulate_params(model, theta, groups)
 
     results = []

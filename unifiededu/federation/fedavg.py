@@ -13,7 +13,6 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ..models.gnn_params import ThetaVector
 from ..config import FederationConfig, ModelGraphConfig
 
 
@@ -33,13 +32,9 @@ class FedAvgServer:
     ) -> None:
         self.num_clients = num_clients
         self.cfg         = fed_config
-        self.k_edge      = mg_config.k_edge
-        self.k_node      = mg_config.k_node
-        self.p           = 2 * self.k_edge + 1 + 2 * self.k_node + 1
 
-        self._global_theta: torch.Tensor = ThetaVector(
-            self.k_edge, self.k_node
-        ).theta.detach().clone()
+        # Lazy-initialised from the first aggregate() call
+        self._global_theta: Optional[torch.Tensor] = None
 
         self._client_ids: List[int] = list(range(num_clients))
         self._round: int = 0

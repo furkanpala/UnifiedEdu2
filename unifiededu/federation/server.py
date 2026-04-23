@@ -22,7 +22,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ..models.gnn_params import ThetaVector, theta_from_flat
 from ..config import FederationConfig, ModelGraphConfig
 from .clustering import (
     ClusterResult,
@@ -104,12 +103,11 @@ class FederationServer:
         self.cfg         = fed_config
         self.k_edge      = mg_config.k_edge
         self.k_node      = mg_config.k_node
-        self.p           = 2 * self.k_edge + 1 + 2 * self.k_node + 1
 
-        # Global Theta -- shared starting point, updated after inter-cluster agg
-        self._global_theta: torch.Tensor = ThetaVector(
-            self.k_edge, self.k_node
-        ).theta.detach().clone()
+        # Global Theta — initialised lazily from the first round's uploads.
+        # Clients are responsible for creating a fresh ThetaVector/ThetaGNN
+        # when local_train receives None.
+        self._global_theta: Optional[torch.Tensor] = None
 
         # Per-client theta broadcast at the start of each round
         self._client_thetas: Dict[int, torch.Tensor] = {}

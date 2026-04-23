@@ -6,8 +6,20 @@ from typing import List
 
 @dataclass
 class ModelGraphConfig:
-    k_node: int = 32   # node groups for Theta
-    k_edge: int = 32   # edge groups for Theta
+    # LoRA adapter dimensions (ThetaVector)
+    lora_rank:  int   = 8     # rank of per-layer LoRA adapters
+    lora_alpha: float = 1.0   # LoRA scaling: effective delta = alpha/rank * A@B
+
+    # Graph-based Theta (ThetaGNN) — used when use_gnn_theta=True
+    gnn_hidden_dim: int   = 64    # GNN hidden dimension
+    gnn_scale_clip: float = 0.3   # max |multiplicative delta|
+    gnn_shift_clip: float = 0.1   # max |additive delta| in units of weight std
+    use_gnn_theta:  bool  = False # False → LoRA ThetaVector, True → ThetaGNN
+
+    # Clustering group counts (used for dynamic cluster assignment only,
+    # NOT for controlling Theta size with the new LoRA/GNN design)
+    k_node: int = 32
+    k_edge: int = 32
 
 
 @dataclass
