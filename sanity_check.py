@@ -24,7 +24,7 @@ from torch.func import functional_call
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from unifiededu.federation.client import assign_layer_groups, modulate_params
+from unifiededu.federation.client import assign_layer_groups, modulate_params, _functional_generate
 from unifiededu.models.gnn_params import ThetaVector
 from unifiededu.data.dataset import _tokenize_sample
 
@@ -41,21 +41,6 @@ SAMPLE = {
 }
 
 
-def _generate(model, tokenizer, prompt: str, max_new_tokens: int, device: str) -> str:
-    pad_id = tokenizer.pad_token_id or 0
-    enc    = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-    with torch.no_grad():
-        out = model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.7,
-            repetition_penalty=1.3,
-            no_repeat_ngram_size=3,
-            pad_token_id=pad_id,
-        )
-    new_ids = out[0][enc["input_ids"].shape[1]:]
-    return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
 
 def main():
@@ -142,28 +127,17 @@ def main():
     log.info("\n--- Generation after overfitting ---")
     theta.eval()
     modulated    = modulate_params(model, theta, layer_groups)
-    named_params = dict(model.named_parameters())
-    originals    = {}
-    for pname, val in modulated.items():
-        if pname in named_params:
-            originals[pname] = named_params[pname].data.clone()
-            named_params[pname].data.copy_(val)
-
-    try:
-        ctx      = SAMPLE["context"]
-        question = _generate(
-            model, tokenizer,
-            f"Context: {ctx}\n\nQuestion:",
-            args.max_new_tokens, device,
-        )
-        answer = _generate(
-            model, tokenizer,
-            f"Context: {ctx}\n\nQuestion: {question}\nAnswer:",
-            args.max_new_tokens, device,
-        )
-    finally:
-        for pname, orig in originals.items():
-            named_params[pname].data.copy_(orig)
+    ctx      = SAMPLE["context"]
+    question = _functional_generate(
+        model, tokenizer,
+        f"Context: {ctx}\n\nQuestion:",
+        modulated, args.max_new_tokens, device,
+    )
+    answer = _functional_generate(
+        model, tokenizer,
+        f"Context: {ctx}\n\nQuestion: {question}\nAnswer:",
+        modulated, args.max_new_tokens, device,
+    )
 
     log.info("Context  : %s", ctx)
     log.info("")

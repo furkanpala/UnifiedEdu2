@@ -44,53 +44,34 @@ def _generate_qa_pairs(
     device:         str,
     max_new_tokens: int = 80,
 ) -> List[Dict[str, str]]:
-    from unifiededu.federation.client import assign_layer_groups, modulate_params
+    from unifiededu.federation.client import assign_layer_groups, modulate_params, _functional_generate
     from unifiededu.models.gnn_params import theta_from_flat
 
     theta  = theta_from_flat(theta_flat.to(device), k_edge, k_node)
+    theta.eval()
     groups = assign_layer_groups(model, k_edge, k_node)
     params = modulate_params(model, theta, groups)
 
-    named_params = dict(model.named_parameters())
-    orig_state   = {k: v.data.clone() for k, v in named_params.items() if k in params}
-    for pname, val in params.items():
-        if pname in named_params:
-            named_params[pname].data.copy_(val)
-
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-
-    def _gen(prompt: str) -> str:
-        enc = tokenizer(prompt, return_tensors="pt", max_length=900, truncation=True).to(device)
-        with torch.no_grad():
-            out = model.generate(
-                **enc,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-                repetition_penalty=1.3,
-                no_repeat_ngram_size=3,
-                pad_token_id=pad_id,
-            )
-        new_ids = out[0][enc["input_ids"].shape[1]:]
-        return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-
     results = []
-    try:
-        for s in samples:
-            question = _gen(f"Context: {s['context']}\n\nQuestion:")
-            answer   = _gen(f"Context: {s['context']}\n\nQuestion: {question}\nAnswer:")
-            results.append({
-                "sample_id":    s["sample_id"],
-                "context":      s["context"],
-                "question":     question,
-                "answer":       answer,
-                "ref_question": s["question"],
-                "ref_answer":   s["answer"],
-            })
-    finally:
-        for pname, orig in orig_state.items():
-            named_params[pname].data.copy_(orig)
-
+    for s in samples:
+        question = _functional_generate(
+            model, tokenizer,
+            f"Context: {s['context']}\n\nQuestion:",
+            params, max_new_tokens, device,
+        )
+        answer = _functional_generate(
+            model, tokenizer,
+            f"Context: {s['context']}\n\nQuestion: {question}\nAnswer:",
+            params, max_new_tokens, device,
+        )
+        results.append({
+            "sample_id":    s["sample_id"],
+            "context":      s["context"],
+            "question":     question,
+            "answer":       answer,
+            "ref_question": s["question"],
+            "ref_answer":   s["answer"],
+        })
     return results
 
 

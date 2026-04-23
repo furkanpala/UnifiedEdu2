@@ -131,6 +131,70 @@ def modulate_params(
 
 
 # ---------------------------------------------------------------------------
+# Functional-call-based generation (training-consistent)
+# ---------------------------------------------------------------------------
+
+def _functional_generate(
+    model:          nn.Module,
+    tokenizer,
+    prompt:         str,
+    params:         Dict[str, torch.Tensor],
+    max_new_tokens: int,
+    device:         str,
+) -> str:
+    """
+    Autoregressive generation using functional_call — identical to training.
+
+    Unlike swapping weights in-place, functional_call applies modulated_params
+    exactly as during training, so weight-tied layers (e.g. GPT-2 lm_head/wte)
+    are handled consistently.  KV-cache is used for efficiency.
+    """
+    pad_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None) or 0
+    eos_id = getattr(tokenizer, "eos_token_id", None) or pad_id
+
+    enc     = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    cur_ids = enc["input_ids"].to(device)       # (1, L)
+    all_ids = cur_ids[0].tolist()               # grows as tokens are appended
+    generated: list = []
+    past_kv = None
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            kw = {"input_ids": cur_ids, "use_cache": True}
+            if past_kv is not None:
+                kw["past_key_values"] = past_kv
+
+            out    = functional_call(model, params, args=(), kwargs=kw, strict=False)
+            logits = out.logits[:, -1, :].float()           # (1, V)
+            past_kv = getattr(out, "past_key_values", None)
+
+            # Repetition penalty (applied over the whole sequence seen so far)
+            for tid in set(all_ids):
+                if logits[0, tid] > 0:
+                    logits[0, tid] /= 1.3
+                else:
+                    logits[0, tid] *= 1.3
+
+            # No-repeat trigram suppression
+            if len(all_ids) >= 2:
+                pfx = tuple(all_ids[-2:])
+                for i in range(len(all_ids) - 2):
+                    if tuple(all_ids[i : i + 2]) == pfx:
+                        logits[0, all_ids[i + 2]] = float("-inf")
+
+            probs = torch.softmax(logits / 0.7, dim=-1)
+            nxt   = torch.multinomial(probs, 1).item()
+
+            if nxt == eos_id:
+                break
+            generated.append(nxt)
+            all_ids.append(nxt)
+            cur_ids = torch.tensor([[nxt]], device=device)  # single-token input from here on
+
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
@@ -275,59 +339,35 @@ class FederationClient:
         max_new_tokens: int = 40,
     ) -> str:
         """
-        Generate one QA pair from the stored context sample using modulated weights.
+        Generate one QA pair from the stored context sample.
 
-        Swaps modulated weights into the frozen backbone once, runs two greedy
-        passes (Q then A), and restores the originals.
+        Uses functional_call for both passes so modulated params are applied
+        identically to training (no manual weight swap, no weight-tying edge cases).
         """
         if self.tokenizer is None or not self.sample_context:
             return "[no sample context]"
         try:
             theta     = theta_from_flat(theta_flat.to(self.device), self.k_edge, self.k_node)
+            theta.eval()
             modulated = modulate_params(self.model, theta, self.layer_groups)
 
-            named_params = dict(self.model.named_parameters())
-            originals: Dict[str, torch.Tensor] = {}
-            for pname, val in modulated.items():
-                if pname in named_params:
-                    originals[pname] = named_params[pname].data.clone()
-                    named_params[pname].data.copy_(val)
+            # Prompts match training format:
+            # prefix = "Context: {ctx}\n\nQuestion: ", completion = "{q}\nAnswer: {a}"
+            q_prompt = f"Context: {self.sample_context}\n\nQuestion: "
+            question = _functional_generate(
+                self.model, self.tokenizer, q_prompt, modulated, max_new_tokens, self.device
+            )
 
-            try:
-                # Prompts match the training format exactly:
-                # prefix = "Context: {ctx}\n\nQuestion: ", completion = "{q}\nAnswer: {a}"
-                q_prompt = f"Context: {self.sample_context}\n\nQuestion: "
-                question = self._run_generate(q_prompt, max_new_tokens)
-
-                a_prompt = f"Context: {self.sample_context}\n\nQuestion: {question}\nAnswer: "
-                answer   = self._run_generate(a_prompt, max_new_tokens)
-            finally:
-                for pname, orig in originals.items():
-                    named_params[pname].data.copy_(orig)
+            a_prompt = f"Context: {self.sample_context}\n\nQuestion: {question}\nAnswer: "
+            answer   = _functional_generate(
+                self.model, self.tokenizer, a_prompt, modulated, max_new_tokens, self.device
+            )
 
             return f"Q: {question} | A: {answer}"
 
         except Exception as exc:
             log.debug("generate_qa error: %s", exc)
             return "[generation error]"
-
-    def _run_generate(self, prompt: str, max_new_tokens: int) -> str:
-        """Tokenise prompt, run model.generate with sampling, decode new tokens."""
-        enc       = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
-        input_ids = enc["input_ids"].to(self.device)
-        pad_id    = getattr(self.tokenizer, "pad_token_id", 0) or 0
-        with torch.no_grad():
-            out_ids = self.model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-                repetition_penalty=1.3,
-                no_repeat_ngram_size=3,
-                pad_token_id=pad_id,
-            )
-        new_ids = out_ids[0][input_ids.shape[1]:]
-        return self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
     # ------------------------------------------------------------------
     # Internal helpers
