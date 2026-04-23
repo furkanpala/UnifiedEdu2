@@ -58,10 +58,16 @@ def assign_layer_groups(
     -------
     Dict[module_name, (edge_group_id, node_group_id)]
     """
+    # Only include modules whose weight key is a real (non-tied) parameter.
+    # GPT-2 ties lm_head.weight to transformer.wte.weight, so lm_head.weight
+    # does NOT appear in named_parameters(). functional_call can inject it
+    # during training but the manual swap used for generation would silently
+    # skip it, making training and generation inconsistent.
+    named_param_keys = {n for n, _ in model.named_parameters()}
     groups: Dict[str, Tuple[int, int]] = {}
     i = 0
     for name, module in model.named_modules():
-        if _is_linear_or_conv1d(module):
+        if _is_linear_or_conv1d(module) and (name + ".weight") in named_param_keys:
             groups[name] = (i % k_edge, i % k_node)
             i += 1
     return groups
