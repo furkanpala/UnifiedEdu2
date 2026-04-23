@@ -12,8 +12,8 @@ class ModelGraphConfig:
 
     # Graph-based Theta (ThetaGNN) — used when use_gnn_theta=True
     gnn_hidden_dim: int   = 64    # GNN hidden dimension
-    gnn_scale_clip: float = 0.3   # max |multiplicative delta|
-    gnn_shift_clip: float = 0.1   # max |additive delta| in units of weight std
+    gnn_scale_clip: float = 0.03  # max |multiplicative delta| (3% keeps pretrained manifold intact)
+    gnn_shift_clip: float = 0.01  # max |additive delta| in units of weight std
     use_gnn_theta:  bool  = False # False → LoRA ThetaVector, True → ThetaGNN
 
     # Clustering group counts (used for dynamic cluster assignment only,
@@ -52,7 +52,7 @@ class FederationConfig:
 
 @dataclass
 class TrainingConfig:
-    lr:                          float = 1e-3   # initial LR (high; reduced by plateau scheduler)
+    lr:                          float = 1e-4   # initial LR; reduced by plateau scheduler
     beta1:                       float = 0.9
     beta2:                       float = 0.999
     weight_decay:                float = 1e-2

@@ -433,8 +433,16 @@ def parse_args():
     # Theta architecture
     p.add_argument("--gnn",        action="store_true",
                    help="Use ThetaGNN (required for heterogeneous backbone architectures)")
-    p.add_argument("--lora-rank",  type=int, default=None,
+    p.add_argument("--lora-rank",  type=int,   default=None,
                    help="LoRA rank for ThetaVector (default: from config, 8)")
+    # Optimiser / LR
+    p.add_argument("--lr",         type=float, default=None,
+                   help="Initial learning rate (default: 1e-4)")
+    # GNN modulation bounds
+    p.add_argument("--scale-clip", type=float, default=None,
+                   help="GNN max multiplicative weight delta (default: 0.03)")
+    p.add_argument("--shift-clip", type=float, default=None,
+                   help="GNN max additive weight delta in σ(W) units (default: 0.01)")
     return p.parse_args()
 
 
@@ -459,6 +467,12 @@ def main():
         cfg.model_graph.use_gnn_theta = True
     if args.lora_rank is not None:
         cfg.model_graph.lora_rank = args.lora_rank
+    if args.lr is not None:
+        cfg.training.lr = args.lr
+    if args.scale_clip is not None:
+        cfg.model_graph.gnn_scale_clip = args.scale_clip
+    if args.shift_clip is not None:
+        cfg.model_graph.gnn_shift_clip = args.shift_clip
     cfg.device = args.device
 
     # Load processed splits
