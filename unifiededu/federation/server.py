@@ -144,8 +144,14 @@ class FederationServer:
         global Theta.  After clustering, clients in the same cluster share
         the same cluster-mean Theta (set by the previous aggregate() call).
         """
-        return {cid: self._client_thetas.get(cid, self._global_theta).clone()
-                for cid in self._client_ids}
+        return {
+            cid: (
+                self._client_thetas[cid].clone()
+                if cid in self._client_thetas
+                else (self._global_theta.clone() if self._global_theta is not None else None)
+            )
+            for cid in self._client_ids
+        }
 
     # ------------------------------------------------------------------
     # Step 3: aggregate

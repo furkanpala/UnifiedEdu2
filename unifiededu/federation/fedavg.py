@@ -45,6 +45,8 @@ class FedAvgServer:
 
     def broadcast(self) -> Dict[int, torch.Tensor]:
         """Every client receives the same global Theta."""
+        if self._global_theta is None:
+            return {cid: None for cid in self._client_ids}
         return {cid: self._global_theta.clone() for cid in self._client_ids}
 
     def aggregate(
