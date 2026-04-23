@@ -52,7 +52,7 @@ class FederationConfig:
 
 @dataclass
 class TrainingConfig:
-    lr:                          float = 1e-4
+    lr:                          float = 1e-3   # initial LR (high; reduced by plateau scheduler)
     beta1:                       float = 0.9
     beta2:                       float = 0.999
     weight_decay:                float = 1e-2
@@ -61,6 +61,10 @@ class TrainingConfig:
     gradient_accumulation_steps: int   = 4
     max_seq_len:                 int   = 1024
     chunk_stride:                int   = 128
+    # LR scheduler settings
+    lr_patience:                 int   = 3     # plateau rounds before reducing LR
+    lr_factor:                   float = 0.5   # multiplicative reduction factor
+    lr_min:                      float = 1e-5  # floor LR
 
 
 @dataclass

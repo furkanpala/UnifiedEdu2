@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 log = logging.getLogger(__name__)
 
@@ -312,6 +313,14 @@ class FederationClient:
             "ThetaGNN" if use_gnn_theta else f"LoRA rank={lora_rank}",
         )
 
+        # LR scheduler state — persisted across federation rounds
+        self._current_lr    = train_config.lr
+        self._best_val_loss = float("inf")
+        self._no_improve    = 0
+        self._lr_patience   = train_config.lr_patience
+        self._lr_factor     = train_config.lr_factor
+        self._lr_min        = train_config.lr_min
+
     # ------------------------------------------------------------------
     # Theta factory helpers
     # ------------------------------------------------------------------
@@ -334,16 +343,21 @@ class FederationClient:
 
     def local_train(self, theta_flat: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        Perform one local epoch of AdamW optimisation.
+        Perform one local training round with two-level LR scheduling:
+
+          - CosineAnnealingLR within the round: smoothly decays from
+            self._current_lr to 10 % of it over all local steps.
+          - Cross-round ReduceLROnPlateau: after each epoch, val loss is
+            evaluated and self._current_lr is halved when it plateaus for
+            self._lr_patience consecutive epochs.  This persists across rounds.
 
         Parameters
         ----------
-        theta_flat : flat Theta from the server, or None on round 1
-            (None triggers a fresh kaiming/zero initialisation).
+        theta_flat : flat Theta from the server, or None on round 1.
 
         Returns
         -------
-        Updated flat Theta after one local epoch, shape (p,).
+        Updated flat Theta, shape (p,).
         """
         if theta_flat is None:
             theta = self.make_theta()
@@ -352,20 +366,29 @@ class FederationClient:
 
         optimizer = AdamW(
             theta.parameters(),
-            lr=self.train_config.lr,
+            lr=self._current_lr,
             betas=(self.train_config.beta1, self.train_config.beta2),
             weight_decay=self.train_config.weight_decay,
         )
 
-        accum     = self.train_config.gradient_accumulation_steps
-        local_eps = self.train_config.local_epochs
+        accum      = self.train_config.gradient_accumulation_steps
+        local_eps  = self.train_config.local_epochs
+        n_batches  = max(1, len(self.dataloader))
+        # Total optimizer steps this round (one step per accum window)
+        total_steps = local_eps * max(1, n_batches // accum)
+        cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=self._current_lr * 0.1,
+        )
+
         theta.train()
         optimizer.zero_grad()
 
         for epoch in range(local_eps):
             pending    = 0
             epoch_loss = 0.0
-            n_batches  = 0
+            n_seen     = 0
 
             for batch in self.dataloader:
                 loss = self._compute_loss(batch, theta)
@@ -373,26 +396,74 @@ class FederationClient:
 
                 pending    += 1
                 epoch_loss += loss.item()
-                n_batches  += 1
+                n_seen     += 1
 
                 if pending == accum:
                     torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                     optimizer.step()
+                    cosine.step()
                     optimizer.zero_grad()
                     pending = 0
 
             if pending > 0:
                 torch.nn.utils.clip_grad_norm_(theta.parameters(), max_norm=1.0)
                 optimizer.step()
+                cosine.step()
                 optimizer.zero_grad()
 
-            avg = epoch_loss / max(n_batches, 1)
+            avg = epoch_loss / max(n_seen, 1)
             log.info(
-                "C%d(%s) ep%d/%d  avg_loss=%.4f",
-                self.client_id, self.model_name, epoch + 1, local_eps, avg,
+                "C%d(%s) ep%d/%d  loss=%.4f  lr=%.2e",
+                self.client_id, self.model_name, epoch + 1, local_eps,
+                avg, optimizer.param_groups[0]["lr"],
             )
 
+            # Cross-round plateau check: reduce self._current_lr when val stagnates
+            if self.val_dataloader is not None:
+                theta.eval()
+                val_loss = self._eval_val(theta)
+                theta.train()
+                self._step_plateau(val_loss, optimizer)
+                log.info(
+                    "C%d(%s) ep%d val=%.4f  base_lr=%.2e",
+                    self.client_id, self.model_name, epoch + 1,
+                    val_loss, self._current_lr,
+                )
+
         return theta.theta.detach().clone()
+
+    def _eval_val(self, theta) -> float:
+        """Compute mean val loss without modifying theta's train/eval state."""
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                total += self._compute_loss(batch, theta).item()
+                n += 1
+        return total / max(n, 1)
+
+    def _step_plateau(self, val_loss: float, optimizer) -> None:
+        """
+        Reduce self._current_lr by lr_factor when val_loss fails to improve
+        for lr_patience consecutive calls.  Also updates the live optimizer so
+        the reduction takes effect within the current round's remaining epochs.
+        """
+        if val_loss < self._best_val_loss - 1e-4:
+            self._best_val_loss = val_loss
+            self._no_improve    = 0
+        else:
+            self._no_improve += 1
+            if self._no_improve >= self._lr_patience:
+                new_lr = max(self._current_lr * self._lr_factor, self._lr_min)
+                if new_lr < self._current_lr:
+                    log.info(
+                        "C%d(%s) plateau: lr %.2e -> %.2e (val=%.4f, no_improve=%d)",
+                        self.client_id, self.model_name,
+                        self._current_lr, new_lr, val_loss, self._no_improve,
+                    )
+                    self._current_lr = new_lr
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = new_lr
+                self._no_improve = 0
 
     def compute_val_loss(self, theta_flat: Optional[torch.Tensor]) -> float:
         """Mean loss on the validation set; returns nan if no val_dataloader."""
@@ -403,12 +474,7 @@ class FederationClient:
         else:
             theta = self._theta_from_flat(theta_flat.to(self.device))
         theta.eval()
-        total, n = 0.0, 0
-        with torch.no_grad():
-            for batch in self.val_dataloader:
-                total += self._compute_loss(batch, theta).item()
-                n += 1
-        return total / max(n, 1)
+        return self._eval_val(theta)
 
     def generate_qa(
         self,
