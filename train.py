@@ -430,6 +430,11 @@ def parse_args():
     p.add_argument("--device",       default="cpu")
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--log-level",  default="INFO")
+    # Theta architecture
+    p.add_argument("--gnn",        action="store_true",
+                   help="Use ThetaGNN (required for heterogeneous backbone architectures)")
+    p.add_argument("--lora-rank",  type=int, default=None,
+                   help="LoRA rank for ThetaVector (default: from config, 8)")
     return p.parse_args()
 
 
@@ -450,6 +455,10 @@ def main():
         cfg.federation.num_rounds = args.num_rounds
     if args.local_epochs is not None:
         cfg.training.local_epochs = args.local_epochs
+    if args.gnn:
+        cfg.model_graph.use_gnn_theta = True
+    if args.lora_rank is not None:
+        cfg.model_graph.lora_rank = args.lora_rank
     cfg.device = args.device
 
     # Load processed splits
