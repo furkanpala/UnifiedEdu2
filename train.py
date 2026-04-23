@@ -229,6 +229,23 @@ def _load_latest_checkpoint(output_dir: str) -> Optional[dict]:
 # Per-round logging
 # ---------------------------------------------------------------------------
 
+def _log_qa_sample(round_num: int, client_idx: int, model_name: str, qa: dict) -> None:
+    """Log one generated QA sample with context, question, and answer on separate lines."""
+    ctx_preview = (qa["context"][:300] + "...") if len(qa["context"]) > 300 else qa["context"]
+    copy_warn_q = "  [⚠ copying context]" if qa["copy_ratio_q"] > 0.5 else ""
+    copy_warn_a = "  [⚠ copying context]" if qa["copy_ratio_a"] > 0.5 else ""
+    log.info(
+        "Round %d  C%d(%s) sample QA\n"
+        "  Context : %s\n"
+        "  Question: %s%s\n"
+        "  Answer  : %s%s",
+        round_num, client_idx, model_name,
+        ctx_preview,
+        qa["question"], copy_warn_q,
+        qa["answer"],   copy_warn_a,
+    )
+
+
 def _log_round(
     round_num:  int,
     total_rounds: int,
@@ -300,8 +317,7 @@ def run_individual(
             if valid:
                 round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}"})
             for i, client in enumerate(clients):
-                q = client.generate_qa(thetas[i])
-                log.info("Round %d  C%d(%s) sample QA: %s", t, i, client.model_name, q)
+                _log_qa_sample(t, i, client.model_name, client.generate_qa(thetas[i]))
 
         _log_round(t, num_rounds, uploads, None, time.time() - t0, log_path, val_losses)
         if t % 10 == 0:
@@ -347,8 +363,7 @@ def _run_federated(
                 k = server.cluster_result.num_clusters if server.cluster_result else "?"
                 round_pbar.set_postfix({"val": f"{sum(valid)/len(valid):.4f}", "K": k})
             for i, client in enumerate(clients):
-                q = client.generate_qa(uploads[i])
-                log.info("Round %d  C%d(%s) sample QA: %s", t, i, client.model_name, q)
+                _log_qa_sample(t, i, client.model_name, client.generate_qa(uploads[i]))
 
         _log_round(t, num_rounds, uploads, server.cluster_result,
                     time.time() - t0, log_path, val_losses)

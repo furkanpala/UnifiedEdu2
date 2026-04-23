@@ -20,6 +20,7 @@ the frozen backbone, making training/generation fully consistent.
 
 from __future__ import annotations
 
+import difflib
 import logging
 from typing import Dict, Optional, Tuple
 
@@ -30,6 +31,20 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 log = logging.getLogger(__name__)
+
+
+def _copy_ratio(generated: str, context: str) -> float:
+    """
+    Fraction of `generated` that is a verbatim substring match with `context`.
+    Uses SequenceMatcher so it catches any contiguous run of copied tokens,
+    not just full-overlap.  Returns 0.0–1.0.
+    """
+    if not generated:
+        return 0.0
+    sm = difflib.SequenceMatcher(None, generated.lower(), context.lower(), autojunk=False)
+    matched = sum(block.size for block in sm.get_matching_blocks())
+    return matched / len(generated)
+
 
 from ..models.gnn_params import (
     ThetaVector,
@@ -480,15 +495,29 @@ class FederationClient:
         self,
         theta_flat:     Optional[torch.Tensor],
         max_new_tokens: int = 40,
-    ) -> str:
+    ) -> dict:
         """
         Generate one QA pair from the stored context sample.
+
+        Returns a dict with keys:
+            context       : the passage given as input to the model
+            question      : generated question (model completes "Question: ")
+            answer        : generated answer   (model completes "Answer: ")
+            copy_ratio_q  : fraction of question that is verbatim context copy
+            copy_ratio_a  : fraction of answer   that is verbatim context copy
 
         Uses functional_call so modulated params are applied identically to
         training — weight-tied layers handled correctly.
         """
+        empty = {
+            "context": self.sample_context or "",
+            "question": "[no sample context]",
+            "answer": "",
+            "copy_ratio_q": 0.0,
+            "copy_ratio_a": 0.0,
+        }
         if self.tokenizer is None or not self.sample_context:
-            return "[no sample context]"
+            return empty
         try:
             if theta_flat is None:
                 theta = self.make_theta()
@@ -505,11 +534,17 @@ class FederationClient:
             answer   = _functional_generate(
                 self.model, self.tokenizer, a_prompt, modulated, max_new_tokens, self.device
             )
-            return f"Q: {question} | A: {answer}"
+            return {
+                "context":      self.sample_context,
+                "question":     question,
+                "answer":       answer,
+                "copy_ratio_q": _copy_ratio(question, self.sample_context),
+                "copy_ratio_a": _copy_ratio(answer,   self.sample_context),
+            }
 
         except Exception as exc:
             log.debug("generate_qa error: %s", exc)
-            return "[generation error]"
+            return {**empty, "question": "[generation error]"}
 
     # ------------------------------------------------------------------
     # Internal helpers
