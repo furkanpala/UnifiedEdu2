@@ -215,8 +215,7 @@ def _functional_generate(
 
     enc     = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
     cur_ids = enc["input_ids"].to(device)
-    all_ids = cur_ids[0].tolist()
-    generated: list = []
+    generated: list = []   # only tokens the model generated (not the prompt)
     past_kv = None
 
     with torch.no_grad():
@@ -229,26 +228,29 @@ def _functional_generate(
             logits  = out.logits[:, -1, :].float()
             past_kv = getattr(out, "past_key_values", None)
 
-            # Repetition penalty
-            for tid in set(all_ids):
+            # Repetition penalty — only on already-generated tokens, not the prompt.
+            # Applying it to prompt tokens penalises the entire English vocabulary
+            # (context fills most of it), forcing the model into OOD Unicode tokens.
+            for tid in set(generated):
                 if logits[0, tid] > 0:
                     logits[0, tid] /= 1.3
                 else:
                     logits[0, tid] *= 1.3
 
-            # No-repeat trigram
-            if len(all_ids) >= 2:
-                pfx = tuple(all_ids[-2:])
-                for i in range(len(all_ids) - 2):
-                    if tuple(all_ids[i : i + 2]) == pfx:
-                        logits[0, all_ids[i + 2]] = float("-inf")
+            # No-repeat trigram — only within the generated span.
+            # Extending it into the prompt bans the 3rd word of any context quote,
+            # which is exactly what extractive QA answers do by design.
+            if len(generated) >= 2:
+                pfx = tuple(generated[-2:])
+                for i in range(len(generated) - 2):
+                    if tuple(generated[i : i + 2]) == pfx:
+                        logits[0, generated[i + 2]] = float("-inf")
 
             probs = torch.softmax(logits / 0.7, dim=-1)
             nxt   = torch.multinomial(probs, 1).item()
             if nxt == eos_id:
                 break
             generated.append(nxt)
-            all_ids.append(nxt)
             cur_ids = torch.tensor([[nxt]], device=device)
 
     return tokenizer.decode(generated, skip_special_tokens=True).strip()
